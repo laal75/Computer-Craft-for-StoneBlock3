@@ -1,0 +1,11 @@
+# ROOMVA blockmap - Room 5
+# format: x y z blockName
+8 1 -4 minecraft:air
+9 1 -4 minecraft:air
+7 1 -4 minecraft:air
+6 0 -4 minecraft:air
+7 0 -4 minecraft:air
+8 0 -4 minecraft:air
+10 1 -4 minecraft:air
+9 0 -4 minecraft:air
+10 0 -4 minecraft:air

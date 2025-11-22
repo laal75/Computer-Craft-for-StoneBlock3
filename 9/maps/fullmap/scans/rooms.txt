@@ -1,0 +1,6 @@
+# ROOMVA rooms
+0 size=212 vol=1235 type=largeRoom bboxX=[-5..7] bboxY=[-1..3] bboxZ=[-13..5] avgN=3.77
+1 size=36 vol=112 type=smallRoom bboxX=[9..15] bboxY=[0..1] bboxZ=[-2..5] avgN=2.94
+2 size=2 vol=2 type=tiny bboxX=[18..18] bboxY=[0..1] bboxZ=[4..4] avgN=1.00
+3 size=3 vol=4 type=tiny bboxX=[17..17] bboxY=[0..1] bboxZ=[2..3] avgN=1.33
+4 size=9 vol=10 type=tiny bboxX=[6..10] bboxY=[0..1] bboxZ=[-4..-4] avgN=2.44

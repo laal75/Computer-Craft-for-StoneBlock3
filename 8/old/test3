@@ -1,0 +1,27 @@
+-- GPS POSITION
+local function getpos()
+    local x,y,z = gps.locate(3)
+    if not x then error("GPS not available") end
+    return x,y,z
+end
+
+-- HARD SET POSITIONS
+local HOME = {x = 37, y = 2, z = -19}
+local TARGET = {x = 9, y = 2, z = 3}
+
+
+local function pickxyz()
+	x, y, z = getpos()
+	--if (y/TARGET.y) ~=1 do
+	print((y/TARGET.y) ~=1)
+end
+
+-- MAIN
+while true do
+	print("Calulating...")
+	pickxyz(TARGET.x, TARGET.y, TARGET.z)
+	print("Returning home...")
+	pickxyz(HOME.x, HOME.y, HOME.z)
+	print("Done!")
+end
+

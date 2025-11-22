@@ -1,0 +1,4 @@
+# ROOMVA worldmap - Room 2
+# format: x y z value(0=free,1=blocked)
+18 1 4 0.0
+18 0 4 0.0

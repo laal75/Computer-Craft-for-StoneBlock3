@@ -1,0 +1,2 @@
+# ROOMVA links between rooms
+# format: Link: Room N <-> Room M via Door (x, y, z)

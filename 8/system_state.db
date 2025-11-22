@@ -1,0 +1,7 @@
+{
+  totalBlocksDug = 0,
+  totalItemsMoved = 0,
+  destinationsReached = {
+    [ "37,0,-21" ] = 2,
+  },
+}

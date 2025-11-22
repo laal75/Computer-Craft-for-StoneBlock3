@@ -1,0 +1,429 @@
+-- ======================================================
+-- A.lua — GPS + A* movement library (fixed for Roomva)
+-- Based on SquidLord egps, cleaned + debug-safe
+-- ======================================================
+
+-- Debug switch (set true for spam)
+local DEBUG_A = false
+
+local function dprintA(msg)
+  if DEBUG_A then
+    print("[A DEBUG] "..tostring(msg))
+  end
+end
+
+-- Cache of the current turtle position and direction
+cachedX, cachedY, cachedZ, cachedDir = cachedX, cachedY, cachedZ, cachedDir
+
+-- Directions
+North, West, South, East, Up, Down = 0, 1, 2, 3, 4, 5
+
+local shortNames = {
+  [North] = "N", [West] = "W", [South] = "S",
+  [East]  = "E", [Up]   = "U", [Down]  = "D"
+}
+
+local deltas = {
+  [North] = { 0,  0, -1 },
+  [West]  = { -1, 0,  0 },
+  [South] = { 0,  0,  1 },
+  [East]  = { 1,  0,  0 },
+  [Up]    = { 0,  1,  0 },
+  [Down]  = { 0, -1,  0 },
+}
+
+-- cache world geometry
+cachedWorld = cachedWorld or {}
+
+-- A* parameters
+local stopAt, nilCost = 1500, 1000
+
+---------------------------------------------------------
+-- UTILS
+---------------------------------------------------------
+local function empty(tbl)
+  for _, value in pairs(tbl) do
+    if value ~= nil then
+      return false
+    end
+  end
+  return true
+end
+
+local function ensureDir()
+  if cachedDir == nil or deltas[cachedDir] == nil then
+    dprintA("ensureDir(): cachedDir invalid ("..tostring(cachedDir).."), forcing North")
+    cachedDir = North
+  end
+end
+
+---------------------------------------------------------
+-- detectAll
+---------------------------------------------------------
+function detectAll()
+  ensureDir()
+
+  if not (cachedX and cachedY and cachedZ) then
+    dprintA("detectAll(): position unknown; skipping")
+    return
+  end
+
+  local F = deltas[cachedDir]
+  local U = deltas[Up]
+  local D = deltas[Down]
+
+  cachedWorld[cachedX..":"..cachedY..":"..cachedZ] = 0
+
+  if F then
+    if not turtle.detect() then
+      cachedWorld[(cachedX + F[1])..":"..(cachedY + F[2])..":"..(cachedZ + F[3])] = 0
+    end
+  end
+
+  if U then
+    if not turtle.detectUp() then
+      cachedWorld[(cachedX + U[1])..":"..(cachedY + U[2])..":"..(cachedZ + U[3])] = 0
+    end
+  end
+
+  if D then
+    if not turtle.detectDown() then
+      cachedWorld[(cachedX + D[1])..":"..(cachedY + D[2])..":"..(cachedZ + D[3])] = 0
+    end
+  end
+
+  dprintA(("detectAll(): at (%s,%s,%s) dir=%s"):format(
+    tostring(cachedX), tostring(cachedY), tostring(cachedZ), tostring(cachedDir)))
+end
+
+---------------------------------------------------------
+-- MOVEMENT WRAPPERS
+---------------------------------------------------------
+function forward()
+  ensureDir()
+  local D = deltas[cachedDir]
+  local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]
+  local idx_pos = x..":"..y..":"..z
+
+  if turtle.forward() then
+    cachedX, cachedY, cachedZ = x, y, z
+    detectAll()
+    return true
+  else
+    cachedWorld[idx_pos] = (turtle.detect() and 1 or 0.5)
+    return false
+  end
+end
+
+function back()
+  ensureDir()
+  local D = deltas[cachedDir]
+  local x, y, z = cachedX - D[1], cachedY - D[2], cachedZ - D[3]
+  local idx_pos = x..":"..y..":"..z
+
+  if turtle.back() then
+    cachedX, cachedY, cachedZ = x, y, z
+    detectAll()
+    return true
+  else
+    cachedWorld[idx_pos] = 0.5
+    return false
+  end
+end
+
+function up()
+  local D = deltas[Up]
+  local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]
+  local idx_pos = x..":"..y..":"..z
+
+  if turtle.up() then
+    cachedX, cachedY, cachedZ = x, y, z
+    detectAll()
+    return true
+  else
+    cachedWorld[idx_pos] = (turtle.detectUp() and 1 or 0.5)
+    return false
+  end
+end
+
+function down()
+  local D = deltas[Down]
+  local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]
+  local idx_pos = x..":"..y..":"..z
+
+  if turtle.down() then
+    cachedX, cachedY, cachedZ = x, y, z
+    detectAll()
+    return true
+  else
+    cachedWorld[idx_pos] = (turtle.detectDown() and 1 or 0.5)
+    return false
+  end
+end
+
+function turnLeft()
+  ensureDir()
+  cachedDir = (cachedDir + 1) % 4
+  turtle.turnLeft()
+  detectAll()
+  return true
+end
+
+function turnRight()
+  ensureDir()
+  cachedDir = (cachedDir + 3) % 4
+  turtle.turnRight()
+  detectAll()
+  return true
+end
+
+function turnTo(targetDir)
+  ensureDir()
+  if targetDir == nil then return true end
+  if targetDir == cachedDir then
+    return true
+  elseif ((targetDir - cachedDir + 4) % 4) == 1 then
+    turnLeft()
+  elseif ((cachedDir - targetDir + 4) % 4) == 1 then
+    turnRight()
+  else
+    turnLeft()
+    turnLeft()
+  end
+  return true
+end
+
+---------------------------------------------------------
+-- clearWorld
+---------------------------------------------------------
+function clearWorld()
+  cachedWorld = {}
+  detectAll()
+end
+
+---------------------------------------------------------
+-- A* IMPLEMENTATION
+---------------------------------------------------------
+local function heuristic_cost_estimate(x1, y1, z1, x2, y2, z2)
+  return math.abs(x2 - x1) + math.abs(y2 - y1) + math.abs(z2 - z1)
+end
+
+local function reconstruct_path(cameFrom, currentNode)
+  if cameFrom[currentNode] ~= nil then
+    local dir, nextNode = cameFrom[currentNode][1], cameFrom[currentNode][2]
+    local path = reconstruct_path(cameFrom, nextNode)
+    table.insert(path, dir)
+    return path
+  else
+    return {}
+  end
+end
+
+local function a_star(x1, y1, z1, x2, y2, z2, discover)
+  discover = discover or 1
+  local start, idx_start = {x1, y1, z1}, x1..":"..y1..":"..z1
+  local goal,  idx_goal  = {x2, y2, z2}, x2..":"..y2..":"..z2
+
+  if (cachedWorld[idx_goal] or 0) == 1 then
+    print("no path found (goal blocked)")
+    return {}
+  end
+
+  local openset, closedset, cameFrom, g_score, f_score = {}, {}, {}, {}, {}
+  openset[idx_start] = start
+  g_score[idx_start] = 0
+  f_score[idx_start] = heuristic_cost_estimate(x1, y1, z1, x2, y2, z2)
+
+  while not empty(openset) do
+    local current, idx_current
+    local cur_f = 9999999
+
+    for idx_cur, cur in pairs(openset) do
+      if cur ~= nil and f_score[idx_cur] <= cur_f then
+        idx_current, current, cur_f = idx_cur, cur, f_score[idx_cur]
+      end
+    end
+
+    if not idx_current then break end
+    if idx_current == idx_goal then
+      return reconstruct_path(cameFrom, idx_goal)
+    end
+
+    if cur_f >= stopAt then
+      break
+    end
+
+    openset[idx_current]  = nil
+    closedset[idx_current] = true
+
+    local x3, y3, z3 = current[1], current[2], current[3]
+
+    for dir = 0, 5 do
+      local D = deltas[dir]
+      local x4, y4, z4 = x3 + D[1], y3 + D[2], z3 + D[3]
+      local neighbor, idx_neighbor = {x4, y4, z4}, x4..":"..y4..":"..z4
+      if (cachedWorld[idx_neighbor] or 0) ~= 1 then
+        if closedset[idx_neighbor] == nil then
+          local tentative_g_score = g_score[idx_current] + ((cachedWorld[idx_neighbor] == nil) and discover or 1)
+          if openset[idx_neighbor] == nil or tentative_g_score <= g_score[idx_neighbor] then
+            cameFrom[idx_neighbor] = {dir, idx_current}
+            g_score[idx_neighbor] = tentative_g_score
+            f_score[idx_neighbor] = tentative_g_score + heuristic_cost_estimate(x4, y4, z4, x2, y2, z2)
+            openset[idx_neighbor] = neighbor
+          end
+        end
+      end
+    end
+  end
+
+  print("no path found")
+  return {}
+end
+
+---------------------------------------------------------
+-- moveTo
+---------------------------------------------------------
+function moveTo(targetX, targetY, targetZ, targetDir, changeDir, discover)
+  changeDir = (changeDir == nil) and true or changeDir
+  discover = discover or 1
+  ensureDir()
+
+  if not (cachedX and cachedY and cachedZ) then
+    print("[A] moveTo(): position unknown; call setLocationFromGPS() first")
+    return false
+  end
+
+  local maxAttempts = 50  -- Prevent infinite loops
+  local attempts = 0
+
+  while cachedX ~= targetX or cachedY ~= targetY or cachedZ ~= targetZ do
+    attempts = attempts + 1
+    if attempts > maxAttempts then
+      print("[A] moveTo(): max attempts reached, giving up")
+      return false
+    end
+
+    local path = a_star(cachedX, cachedY, cachedZ, targetX, targetY, targetZ, discover)
+    if #path == 0 then
+      dprintA("moveTo(): no path found")
+      return false
+    end
+
+    local madeProgress = false
+    for _, dir in ipairs(path) do
+      if dir == Up then
+        if up() then
+          madeProgress = true
+        else
+          break
+        end
+      elseif dir == Down then
+        if down() then
+          madeProgress = true
+        else
+          break
+        end
+      else
+        turnTo(dir)
+        if forward() then
+          madeProgress = true
+        else
+          break
+        end
+      end
+    end
+
+    -- If no progress made, we're stuck
+    if not madeProgress then
+      dprintA("moveTo(): no progress made, stuck")
+      return false
+    end
+  end
+
+  if changeDir then
+    turnTo(targetDir or cachedDir)
+  end
+  return true
+end
+
+---------------------------------------------------------
+-- discoverWorld
+---------------------------------------------------------
+function discoverWorld(range)
+  local x, y, z, d = setLocationFromGPS()
+  if not x then
+    print("[A] discoverWorld(): GPS failed, aborting")
+    return
+  end
+
+  print("[A] discoverWorld(): starting at ("..x..","..y..","..z..") range="..range)
+
+  for r = 1, range do
+    for dx = -r, r do
+      for dy = -r, r do
+        for dz = -r, r do
+          local gx, gy, gz = x+dx, y+dy, z+dz
+          local idx_goal = gx..":"..gy..":"..gz
+          if cachedWorld[idx_goal] == nil then
+            moveTo(gx, gy, gz, cachedDir, false, nilCost)
+            sleep(0.01)
+          end
+        end
+      end
+    end
+  end
+
+  moveTo(x, y, z, d or cachedDir)
+end
+
+---------------------------------------------------------
+-- setLocation / GPS
+---------------------------------------------------------
+function setLocation(x, y, z, d)
+  cachedX, cachedY, cachedZ, cachedDir = x, y, z, d
+  dprintA(("setLocation(): (%s,%s,%s) dir=%s"):format(
+    tostring(x), tostring(y), tostring(z), tostring(d)))
+  detectAll()
+  return cachedX, cachedY, cachedZ, cachedDir
+end
+
+function startGPS()
+  local netOpen, modemSide = false, nil
+  for _, side in pairs(rs.getSides()) do
+    if peripheral.getType(side) == "modem" then
+      modemSide = side
+      if rednet.isOpen(side) then
+        netOpen = true
+        break
+      end
+    end
+  end
+  if not netOpen then
+    if modemSide then
+      rednet.open(modemSide)
+    else
+      print("[A] No modem found for GPS")
+      return false
+    end
+  end
+  return true
+end
+
+function setLocationFromGPS()
+  if not startGPS() then return nil end
+  local x, y, z = gps.locate(4, false)
+  if not x then
+    print("[A] gps.locate() failed")
+    return nil
+  end
+  cachedX, cachedY, cachedZ = x, y, z
+  -- disabled direction auto-detect
+  if not cachedDir then cachedDir = North end
+
+  detectAll()
+  return cachedX, cachedY, cachedZ, cachedDir
+end
+
+function getLocation()
+  return cachedX, cachedY, cachedZ, cachedDir
+end

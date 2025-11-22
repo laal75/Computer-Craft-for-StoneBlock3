@@ -1,0 +1,2 @@
+# ROOMVA doors
+# format: Door at (x, y, z) connects Room N and Room M

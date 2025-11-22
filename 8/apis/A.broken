@@ -1,0 +1,305 @@
+-- =========================================================
+--  A.lua v3.1 — Modern GPS + Movement + A*
+--  NO movement during GPS direction detection (NO wiggle)
+--  Direction system: 1=N, 2=E, 3=S, 4=W, 5=UP, 6=DOWN
+-- =========================================================
+
+------------------------------------------------------------
+-- Public direction constants (global)
+------------------------------------------------------------
+DIR_NORTH = 1
+DIR_EAST  = 2
+DIR_SOUTH = 3
+DIR_WEST  = 4
+DIR_UP    = 5
+DIR_DOWN  = 6
+
+North, East, South, West = DIR_NORTH, DIR_EAST, DIR_SOUTH, DIR_WEST
+Up, Down = DIR_UP, DIR_DOWN
+
+dirNames = {
+    [DIR_NORTH] = "N",
+    [DIR_EAST]  = "E",
+    [DIR_SOUTH] = "S",
+    [DIR_WEST]  = "W",
+    [DIR_UP]    = "U",
+    [DIR_DOWN]  = "D"
+}
+
+------------------------------------------------------------
+-- Internal state
+------------------------------------------------------------
+local cx, cy, cz = 0, 0, 0      -- position
+local cd = DIR_NORTH            -- direction (1–4 always)
+
+------------------------------------------------------------
+-- Direction deltas
+------------------------------------------------------------
+local deltas = {
+    [DIR_NORTH] = {  0,  0, -1 },
+    [DIR_EAST]  = {  1,  0,  0 },
+    [DIR_SOUTH] = {  0,  0,  1 },
+    [DIR_WEST]  = { -1,  0,  0 },
+    [DIR_UP]    = {  0,  1,  0 },
+    [DIR_DOWN]  = {  0, -1,  0 }
+}
+
+local leftOf = {
+    [DIR_NORTH] = DIR_WEST,
+    [DIR_WEST]  = DIR_SOUTH,
+    [DIR_SOUTH] = DIR_EAST,
+    [DIR_EAST]  = DIR_NORTH
+}
+
+local rightOf = {
+    [DIR_NORTH] = DIR_EAST,
+    [DIR_EAST]  = DIR_SOUTH,
+    [DIR_SOUTH] = DIR_WEST,
+    [DIR_WEST]  = DIR_NORTH
+}
+
+------------------------------------------------------------
+-- World map cache for A*
+------------------------------------------------------------
+local world = {}
+
+local function key(x,y,z)
+    return x..":"..y..":"..z
+end
+
+local function markFree(x,y,z)
+    world[key(x,y,z)] = 0
+end
+
+local function markBlocked(x,y,z)
+    world[key(x,y,z)] = 1
+end
+
+------------------------------------------------------------
+-- Scan surroundings (update cache)
+------------------------------------------------------------
+local function scan()
+    -- Current
+    markFree(cx, cy, cz)
+
+    -- Forward
+    local d = deltas[cd]
+    if not turtle.detect() then
+        markFree(cx + d[1], cy + d[2], cz + d[3])
+    else
+        markBlocked(cx + d[1], cy + d[2], cz + d[3])
+    end
+
+    -- Up
+    local u = deltas[DIR_UP]
+    if not turtle.detectUp() then
+        markFree(cx + u[1], cy + u[2], cz + u[3])
+    else
+        markBlocked(cx + u[1], cy + u[2], cz + u[3])
+    end
+
+    -- Down
+    local dn = deltas[DIR_DOWN]
+    if not turtle.detectDown() then
+        markFree(cx + dn[1], cy + dn[2], cz + dn[3])
+    else
+        markBlocked(cx + dn[1], cy + dn[2], cz + dn[3])
+    end
+end
+
+------------------------------------------------------------
+-- Movement wrappers (ALWAYS correct cd)
+------------------------------------------------------------
+function forward()
+    local d = deltas[cd]
+    if turtle.forward() then
+        cx, cy, cz = cx + d[1], cy + d[2], cz + d[3]
+        scan()
+        return true
+    end
+    markBlocked(cx + d[1], cy + d[2], cz + d[3])
+    return false
+end
+
+function back()
+    local d = deltas[cd]
+    if turtle.back() then
+        cx, cy, cz = cx - d[1], cy - d[2], cz - d[3]
+        scan()
+        return true
+    end
+    return false
+end
+
+function up()
+    local d = deltas[DIR_UP]
+    if turtle.up() then
+        cx, cy, cz = cx + d[1], cy + d[2], cz + d[3]
+        scan()
+        return true
+    end
+    markBlocked(cx + d[1], cy + d[2], cz + d[3])
+    return false
+end
+
+function down()
+    local d = deltas[DIR_DOWN]
+    if turtle.down() then
+        cx, cy, cz = cx + d[1], cy + d[2], cz + d[3]
+        scan()
+        return true
+    end
+    markBlocked(cx + d[1], cy + d[2], cz + d[3])
+    return false
+end
+
+function turnLeft()
+    turtle.turnLeft()
+    cd = leftOf[cd]
+    scan()
+    return true
+end
+
+function turnRight()
+    turtle.turnRight()
+    cd = rightOf[cd]
+    scan()
+    return true
+end
+
+function turnTo(dir)
+    if not dir or dir < DIR_NORTH or dir > DIR_WEST then return end
+    while cd ~= dir do
+        turnRight()
+    end
+end
+
+------------------------------------------------------------
+-- GPS functions (NO MOVEMENT)
+------------------------------------------------------------
+function startGPS()
+    for _, side in pairs(rs.getSides()) do
+        if peripheral.getType(side) == "modem" then
+            if not rednet.isOpen(side) then
+                rednet.open(side)
+            end
+            return true
+        end
+    end
+    print("[A.lua] No modem found for GPS")
+    return false
+end
+
+-- NO forward/back probing — keeps the turtle still
+function setLocationFromGPS()
+    if not startGPS() then return nil end
+
+    local x, y, z = gps.locate(3)
+    if not x then
+        print("[A.lua] GPS locate failed")
+        return nil
+    end
+
+    cx, cy, cz = x, y, z
+
+    -- cd stays correct because all movement uses wrappers
+    if not cd then cd = DIR_NORTH end
+
+    scan()
+    return cx, cy, cz, cd
+end
+
+function getLocation()
+    return cx, cy, cz, cd
+end
+
+------------------------------------------------------------
+-- A* PATHFINDING
+------------------------------------------------------------
+local function h(x1,y1,z1,x2,y2,z2)
+    return math.abs(x2-x1) + math.abs(y2-y1) + math.abs(z2-z1)
+end
+
+local function neighbors(x,y,z)
+    local list = {}
+    for dir = DIR_NORTH, DIR_DOWN do
+        local d = deltas[dir]
+        local nx, ny, nz = x+d[1], y+d[2], z+d[3]
+        local k = key(nx,ny,nz)
+        if (world[k] or 0) == 0 then
+            table.insert(list, {dir=dir, x=nx, y=ny, z=nz})
+        end
+    end
+    return list
+end
+
+local function astar(tx,ty,tz)
+    local startK = key(cx,cy,cz)
+    local goalK  = key(tx,ty,tz)
+
+    local open = {[startK]=true}
+    local came = {}
+    local g = {[startK]=0}
+    local f = {[startK]=h(cx,cy,cz,tx,ty,tz)}
+
+    while next(open) do
+        local best, bestF = nil, math.huge
+        for n in pairs(open) do
+            if f[n] and f[n] < bestF then
+                best, bestF = n, f[n]
+            end
+        end
+        if not best then break end
+        if best == goalK then
+            -- reconstruct path
+            local path = {}
+            local cur = goalK
+            while came[cur] do
+                table.insert(path, 1, came[cur].dir)
+                cur = came[cur].from
+            end
+            return path
+        end
+
+        open[best] = nil
+        local bx,by,bz = best:match("([^:]+):([^:]+):([^:]+)")
+        bx,by,bz = tonumber(bx), tonumber(by), tonumber(bz)
+
+        for _,nb in ipairs(neighbors(bx,by,bz)) do
+            local nk = key(nb.x,nb.y,nb.z)
+            local newG = g[best] + 1
+            if not g[nk] or newG < g[nk] then
+                came[nk] = {from=best, dir=nb.dir}
+                g[nk] = newG
+                f[nk] = newG + h(nb.x,nb.y,nb.z,tx,ty,tz)
+                open[nk] = true
+            end
+        end
+    end
+
+    return {}
+end
+
+------------------------------------------------------------
+-- moveTo (pathfind + final facing)
+------------------------------------------------------------
+function moveTo(x,y,z,facing)
+    local path = astar(x,y,z)
+    for _,dir in ipairs(path) do
+        if dir == DIR_UP then
+            if not up() then return false end
+        elseif dir == DIR_DOWN then
+            if not down() then return false end
+        else
+            turnTo(dir)
+            if not forward() then return false end
+        end
+    end
+
+    -- Always orient at the end (your “A” choice)
+    if facing then
+        turnTo(facing)
+    end
+
+    return true
+end

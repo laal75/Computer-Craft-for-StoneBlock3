@@ -1,0 +1,2 @@
+# ROOMVA rooms
+0 size=51 vol=264 type=room bboxX=[1..11] bboxY=[0..2] bboxZ=[-4..3] avgN=3.18

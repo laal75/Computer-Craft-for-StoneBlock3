@@ -1,0 +1,3 @@
+# ROOMVA blockmap - Room 7
+# format: x y z blockName
+1 0 4 minecraft:air
