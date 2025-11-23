@@ -1,0 +1,376 @@
+-- chunky_b.lua  (Turtle B: chunky support turtle)
+-- Run this on your support turtle.
+
+-- CONFIG
+local MODEM_SIDE = "left"          -- change if your modem is on a different side
+local GPS_TIMEOUT = 2
+local GPS_RETRIES = 3
+local FOLLOW_DISTANCE = 1
+local CHUNK_SPRINT_TIMEOUT = 45    -- if target in different chunk, sprint aggressively up to this many seconds
+local MOVE_TIMEOUT = 40
+local SLOW_FOLLOW_POLL = 1.0
+local FAST_FOLLOW_POLL = 0.4
+local GIVE_FUEL_ITEMS = 6         -- how many fuel items to drop in a handover
+local STUCK_LIMIT = 6
+
+-- COMM
+rednet.open(MODEM_SIDE)
+
+-- STATE
+local lastPositions = {}          -- store last two A positions { {x,y,z,step}, {x,y,z,step} }
+local mission = "follow"          -- "follow", "fuel", "empty"
+local lastSeenTs = 0
+
+-- UTILS
+local function debug(...) print("[B]", ...) end
+
+local function gpsLocate()
+    for i=1,GPS_RETRIES do
+        local x,y,z = gps.locate(GPS_TIMEOUT)
+        if x then return x,y,z end
+        sleep(0.1)
+    end
+    return nil
+end
+
+local function chunkCoord(x) return math.floor(x / 16) end
+local function inSameChunk(a,b)
+    return chunkCoord(a.x) == chunkCoord(b.x) and chunkCoord(a.z) == chunkCoord(b.z)
+end
+
+local function distanceMan(a,b)
+    return math.abs(a.x - b.x) + math.abs(a.y - b.y) + math.abs(a.z - b.z)
+end
+
+-- safe move helpers
+local function safeForward()
+    local tries = 0
+    while turtle.detect() and tries < 8 do
+        -- if there's a turtle, signal it and wait
+        local ok, data = turtle.inspect()
+        if ok and data and data.name and data.name:match("turtle") then
+            -- signal via redstone? we use rednet for high level; pause a moment
+            sleep(0.25)
+        else
+            turtle.dig()
+        end
+        tries = tries + 1
+        sleep(0.05)
+    end
+    return turtle.forward()
+end
+local function safeUp()
+    while turtle.detectUp() do turtle.digUp(); sleep(0.05) end
+    return turtle.up()
+end
+local function safeDown()
+    while turtle.detectDown() do turtle.digDown(); sleep(0.05) end
+    return turtle.down()
+end
+
+-- compute forward vector from last two A positions (returns unit vector with axis-aligned component)
+local function computeForward()
+    if #lastPositions < 2 then return nil end
+    local a = lastPositions[#lastPositions-1]
+    local b = lastPositions[#lastPositions]
+    if not (a and b) then return nil end
+    local dx = b.x - a.x
+    local dy = b.y - a.y
+    local dz = b.z - a.z
+    -- choose dominant horizontal axis for forward (x or z)
+    if math.abs(dx) >= math.abs(dz) then
+        dx = (dx > 0 and 1) or (dx < 0 and -1) or 0
+        dz = 0
+    else
+        dz = (dz > 0 and 1) or (dz < 0 and -1) or 0
+        dx = 0
+    end
+    dy = (dy > 0 and 1) or (dy < 0 and -1) or 0
+    return { x = dx, y = dy, z = dz }
+end
+
+-- goTo: naive GPS-driven approach with chunk-safety and timeouts
+local function goTo(target, allowSprint)
+    allowSprint = allowSprint or false
+    local start = os.time()
+    local stuck = 0
+    local lastPos = nil
+
+    while true do
+        if os.time() - start > MOVE_TIMEOUT then return false, "timeout" end
+        local cx,cy,cz = gpsLocate()
+        if not cx then sleep(0.2); stuck = stuck + 1
+        else
+            local cur = { x = cx, y = cy, z = cz }
+            if lastPos and distanceMan(cur, lastPos) == 0 then stuck = stuck + 1 else stuck = 0 end
+            lastPos = cur
+
+            -- if allowSprint = false and target in different chunk -> return "different_chunk"
+            if not allowSprint and not inSameChunk(cur, target) then return false, "diff_chunk" end
+
+            -- if allowSprint == true, keep going even if chunk differs
+            -- vertical first
+            if cur.y < target.y then
+                if not safeUp() then turtle.digUp(); sleep(0.05) end
+            elseif cur.y > target.y then
+                if not safeDown() then turtle.digDown(); sleep(0.05) end
+            else
+                -- horizontal: try to take a forward-ish step that reduces manhattan distance
+                local bestMoved = false
+                local curDist = distanceMan(cur, target)
+                -- attempt forward, left, right, back by trying small maneuvers
+                -- We'll try to move forward; if it doesn't help, try turning and trying other directions.
+                -- Keep the turtle's orientation constant by turning back after attempts.
+                local function tryDir(turns)
+                    -- turns: -1 left, 0 forward, 1 right, 2 back
+                    if turns == -1 then turtle.turnLeft()
+                    elseif turns == 1 then turtle.turnRight()
+                    elseif turns == 2 then turtle.turnLeft(); turtle.turnLeft() end
+
+                    local moved = safeForward()
+                    local nx,ny,nz = gpsLocate()
+                    local newMoved = false
+                    if moved and nx then
+                        local newPos = { x = nx, y = ny, z = nz }
+                        if distanceMan(newPos, target) < curDist then
+                            newMoved = true
+                        else
+                            -- didn't help -> step back
+                            turtle.back()
+                        end
+                    end
+
+                    -- rotate back to original heading
+                    if turns == -1 then turtle.turnRight()
+                    elseif turns == 1 then turtle.turnLeft()
+                    elseif turns == 2 then turtle.turnLeft(); turtle.turnLeft() end
+
+                    return newMoved
+                end
+
+                -- try prioritized attempts
+                if tryDir(0) then bestMoved = true
+                elseif tryDir(-1) then bestMoved = true
+                elseif tryDir(1) then bestMoved = true
+                elseif tryDir(2) then bestMoved = true end
+
+                if not bestMoved then
+                    -- try climb to bypass obstacle
+                    if safeUp() then
+                        local nx,ny,nz = gpsLocate()
+                        if nx and distanceMan({x=nx,y=ny,z=nz}, target) < curDist then
+                            -- good - continue
+                        else
+                            safeDown() -- revert if useless
+                        end
+                    else
+                        -- try digging and waiting
+                        turtle.dig()
+                        sleep(0.1)
+                    end
+                end
+            end
+
+            if distanceMan(cur, target) <= FOLLOW_DISTANCE then return true end
+        end
+
+        if stuck > STUCK_LIMIT then
+            -- try small climb then continue
+            if safeUp() then sleep(0.05) end
+            stuck = 0
+        end
+
+        sleep(0.05)
+    end
+end
+
+-- approachBehind: compute behind position from A's forward vector and approach it
+local function approachBehind(aPos)
+    -- we need compute forward vector from lastPositions
+    local f = computeForward()
+    if not f then
+        -- fallback: ask A to send recent coords (it broadcasts periodically) -> use lastPositions
+        debug("No forward vector known yet; using last two positions or asking for coords")
+    end
+
+    -- compute desired behind position = aPos - forwardVector
+    local bv = f or {x=0,y=0,z=0}
+    local target = { x = aPos.x - bv.x, y = aPos.y - bv.y, z = aPos.z - bv.z }
+
+    -- ensure we allow sprint if in different chunk
+    local curx,cury,curz = gpsLocate()
+    if curx and not inSameChunk({x=curx,y=cury,z=curz}, aPos) then
+        debug("A is in different chunk -> sprinting to catch up")
+        local ok,err = goTo(target, true)
+        return ok, err
+    else
+        return goTo(target, false)
+    end
+end
+
+-- GIVE FUEL handshake
+local function giveFuelHandshakes(senderId)
+    debug("Attempting to place fuel for miner")
+    -- drop up to GIVE_FUEL_ITEMS coal-like items forward
+    local given = 0
+    for s=1,16 do
+        if given >= GIVE_FUEL_ITEMS then break end
+        local d = turtle.getItemDetail(s)
+        if d and d.name then
+            if string.find(d.name, "coal") or string.find(d.name, "charcoal") then
+                turtle.select(s)
+                local amount = math.min(d.count, GIVE_FUEL_ITEMS - given)
+                turtle.drop(amount)
+                given = given + amount
+                sleep(0.05)
+            end
+        end
+    end
+    -- signal miner we're ready for it to pick up
+    rednet.send(senderId, "ready_fuel", "tunnel")
+    -- wait for acknowledgement
+    local start = os.time()
+    while os.time() - start < HANDSHAKE_TIMEOUT do
+        local sid,msg = rednet.receive("tunnel")
+        if sid and msg == "fuel_received" then
+            debug("Miner acknowledged fuel_received")
+            return true
+        end
+        sleep(0.1)
+    end
+    debug("Timeout waiting for miner ack")
+    return false
+end
+
+-- TAKE ITEMS handshake
+local function takeItemsHandshake(senderId)
+    -- signal miner to drop
+    rednet.send(senderId, "ready_empty", "tunnel")
+    -- wait/perform sucks
+    local start = os.time()
+    for i=1,6 do
+        turtle.suck()
+        sleep(0.12)
+    end
+    -- expect ack
+    local timeout = os.time() + HANDSHAKE_TIMEOUT
+    while os.time() < timeout do
+        local sid,msg = rednet.receive("tunnel")
+        if sid and msg == "empty_received" then
+            debug("Miner acknowledged empty_received")
+            return true
+        end
+        sleep(0.1)
+    end
+    debug("Timeout waiting for miner empty_received ack")
+    return false
+end
+
+-- REDNET RECEIVER: update lastPositions and handle requests
+local function netReceiver()
+    while true do
+        local senderId, msg, proto = rednet.receive("tunnel")
+        if not msg then sleep(0.05) else
+            if type(msg) == "table" and msg.tag == "here" then
+                -- update lastPositions (store limited history of A)
+                table.insert(lastPositions, { x = msg.x, y = msg.y, z = msg.z, step = msg.step })
+                if #lastPositions > 3 then table.remove(lastPositions,1) end
+                lastSeenTs = os.time()
+                if mission == "follow" then
+                    -- nothing else; follower loop picks up lastPositions
+                end
+            elseif type(msg) == "string" then
+                if msg == "needfuel" then
+                    debug("Received needfuel -> mission=fuel")
+                    mission = "fuel"
+                elseif msg == "needempty" then
+                    debug("Received needempty -> mission=empty")
+                    mission = "empty"
+                end
+            end
+        end
+    end
+end
+
+-- FOLLOWER main loop
+local function followerLoop()
+    local poll = SLOW_FOLLOW_POLL
+    while true do
+        if #lastPositions == 0 then
+            sleep(0.3)
+            goto continue()
+        end
+
+        local aPos = lastPositions[#lastPositions]
+        -- ensure B follows 1 block behind and matches elevation changes
+        if mission == "fuel" then
+            local ok,err = approachBehind(aPos)
+            if ok then
+                -- determine sender id by broadcasting a quick "who" and seeing reply? We don't know senderId.
+                -- we will broadcast "announce" and miner's script is listening; miner will reply with sender id.
+                rednet.broadcast({ tag = "req_announce" }, "tunnel")
+                -- wait short time for reply
+                local sid, msg = rednet.receive("tunnel")
+                local minerId = sid
+                if minerId then
+                    giveFuelHandshakes(minerId)
+                else
+                    debug("No miner ID received for handshake")
+                end
+            else
+                debug("approachBehind failed:", err)
+                -- if different chunk, sprint allowed
+                if err == "diff_chunk" then
+                    -- allow sprint
+                    local ok2,err2 = goTo({ x = aPos.x - (computeForward() and computeForward().x or 0),
+                                            y = aPos.y - (computeForward() and computeForward().y or 0),
+                                            z = aPos.z - (computeForward() and computeForward().z or 0) }, true)
+                    if ok2 then
+                        -- try handshake as above
+                        rednet.broadcast({ tag = "req_announce" }, "tunnel")
+                        local sid, msg = rednet.receive("tunnel")
+                        if sid then giveFuelHandshakes(sid) end
+                    end
+                end
+            end
+
+            mission = "follow"
+
+        elseif mission == "empty" then
+            local ok,err = approachBehind(aPos)
+            if ok then
+                rednet.broadcast({ tag = "req_announce" }, "tunnel")
+                local sid, msg = rednet.receive("tunnel")
+                local minerId = sid
+                if minerId then
+                    takeItemsHandshake(minerId)
+                else
+                    debug("No miner ID for empty handshake")
+                end
+            else
+                debug("approachBehind failed for empty:", err)
+            end
+            mission = "follow"
+
+        else -- mission == "follow"
+            -- simply go to a position behind A (non-sprinting; stay chunk-safe)
+            local ok,err = approachBehind(aPos)
+            if not ok and err == "diff_chunk" then
+                -- sprint to catch up aggressively
+                debug("Detected chunk mismatch: sprinting to catch up")
+                local target = { x = aPos.x - (computeForward() and computeForward().x or 0),
+                                 y = aPos.y - (computeForward() and computeForward().y or 0),
+                                 z = aPos.z - (computeForward() and computeForward().z or 0) }
+                local ok2,_ = goTo(target, true)
+                if not ok2 then debug("Sprint failed") end
+            end
+        end
+
+        ::continue::
+        sleep(poll)
+    end
+end
+
+-- START
+debug("Starting Chunky B")
+parallel.waitForAny(netReceiver, followerLoop)

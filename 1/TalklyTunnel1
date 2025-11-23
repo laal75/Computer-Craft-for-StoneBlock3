@@ -1,0 +1,234 @@
+-- miner_a.lua  (Turtle A - Mining Turtle)
+-- Paste on your mining turtle
+
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached") end
+modem.open(10) -- inbound for miner? we'll treat 10 as miner->support
+modem.open(11) -- inbound responses from support
+
+local gps = gps -- gps is global in CC:Tweaked
+
+-- CONFIG
+local coordBroadcastInterval = 5        -- seconds between "here" broadcasts (so B can follow)
+local fuelCheckThreshold = 200         -- when below this, request fuel
+local inventoryFullThreshold = 13      -- if more than this many non-empty slots, request dump
+local gpsTimeout = 2                   -- seconds for gps.locate timeout
+local maxGpsRetries = 3
+
+-- utils
+local function debugPrint(...) print("[A]", ...) end
+
+local function getPos()
+    for i = 1, maxGpsRetries do
+        local x,y,z = gps.locate(gpsTimeout)
+        if x then return x,y,z end
+        sleep(0.3)
+    end
+    return nil
+end
+
+local function countInventory()
+    local used = 0
+    for s = 1,16 do
+        if turtle.getItemCount(s) > 0 then used = used + 1 end
+    end
+    return used
+end
+
+-- fuel utils
+local fuelItems = { "minecraft:coal", "minecraft:charcoal", "minecraft:coal_block" }
+local function hasFuelItem()
+    for s=1,16 do
+        local d = turtle.getItemDetail(s)
+        if d and d.name then
+            for _, name in ipairs(fuelItems) do
+                if d.name == name then return true end
+            end
+        end
+    end
+    return false
+end
+
+local function tryRefuelFromInventory(targetLevel)
+    targetLevel = targetLevel or fuelCheckThreshold
+    for s=1,16 do
+        local d = turtle.getItemDetail(s)
+        if d and d.name then
+            for _, name in ipairs(fuelItems) do
+                if d.name == name then
+                    turtle.select(s)
+                    if turtle.refuel(1) then
+                        debugPrint("Refueled from inventory. Level:", turtle.getFuelLevel())
+                        if turtle.getFuelLevel() >= targetLevel then return true end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- simple safe move utilities (these may dig if needed)
+local function safeForward()
+    while turtle.detect() do
+        turtle.dig()
+        sleep(0.05)
+    end
+    return turtle.forward()
+end
+local function safeUp()
+    while turtle.detectUp() do
+        turtle.digUp()
+        sleep(0.05)
+    end
+    return turtle.up()
+end
+local function safeDown()
+    while turtle.detectDown() do
+        turtle.digDown()
+        sleep(0.05)
+    end
+    return turtle.down()
+end
+
+-- broadcaster: periodically broadcast coords so B can follow
+local broadcastState = { enabled = true }
+local function broadcaster()
+    while true do
+        if broadcastState.enabled then
+            local x,y,z = getPos()
+            if x then
+                local payload = {tag="here", x=x, y=y, z=z}
+                -- send as table (modem.transmit will serialize)
+                modem.transmit(10, 11, payload) -- we send to channel 10 (B listening)
+            end
+        end
+        sleep(coordBroadcastInterval)
+    end
+end
+
+-- receiver: handle incoming messages from B
+local function receiver()
+    while true do
+        local event, side, channel, replyChannel, msg, dist = os.pullEvent("modem_message")
+        -- msg may be a string or table
+        if type(msg) == "string" then
+            if msg == "fuelready" then
+                debugPrint("Support says: fuelready -> trying to suck fuel forward")
+                -- try to suck one item from front
+                turtle.suck()
+                if tryRefuelFromInventory() then
+                    debugPrint("Refueled from received item")
+                else
+                    debugPrint("Maybe received fuel but still below threshold")
+                end
+            elseif msg == "emptyready" then
+                debugPrint("Support ready to receive items. Dropping blocks forward.")
+                for s=1,16 do
+                    if turtle.getItemCount(s) > 0 then
+                        turtle.select(s)
+                        turtle.drop()
+                    end
+                end
+                debugPrint("Dropped inventory.")
+            elseif msg == "ping" then
+                debugPrint("ping received")
+            else
+                debugPrint("MSG:", tostring(msg))
+            end
+        elseif type(msg) == "table" and msg.tag == "askcoords" then
+            local x,y,z = getPos()
+            if x then modem.transmit(10,11, { tag="here", x=x, y=y, z=z }) end
+        end
+    end
+end
+
+-- sender: handles manual input and automatic requests (separate)
+local function manualSender()
+    while true do
+        write("Send: ")
+        local t = read()
+        if t == "passfuel" then
+            -- drop fuel in front (manual)
+            for s=1,16 do
+                local d = turtle.getItemDetail(s)
+                if d and d.name then
+                    for _, name in ipairs(fuelItems) do
+                        if d.name == name then
+                            turtle.select(s)
+                            turtle.drop()
+                            debugPrint("Dropped a fuel item in front (manual).")
+                            break
+                        end
+                    end
+                end
+            end
+        elseif t == "getfuel" then
+            -- request B to pass fuel
+            modem.transmit(10, 11, "getfuel")
+            debugPrint("Requesting passfuel (manual)")
+        else
+            modem.transmit(10, 11, t)
+            debugPrint("Sent:", t)
+        end
+    end
+end
+
+-- automatic monitor: watch fuel & inventory and request support
+local function autoMonitor()
+    local lastNeedFuel = 0
+    local lastNeedEmpty = 0
+    local minInterval = 8 -- seconds between repeat requests
+    while true do
+        -- fuel check
+        local fl = turtle.getFuelLevel()
+        if fl == "unlimited" then fl = math.huge end
+        if fl < fuelCheckThreshold and (os.time() - lastNeedFuel > minInterval) then
+            debugPrint("Fuel low ("..tostring(fl).."), requesting support")
+            modem.transmit(10, 11, "needfuel")
+            -- while waiting for support, broadcast coords more frequently
+            broadcastState.enabled = true
+            coordBroadcastInterval = 1
+            lastNeedFuel = os.time()
+        end
+
+        -- inventory check
+        local used = countInventory()
+        if used >= inventoryFullThreshold and (os.time() - lastNeedEmpty > minInterval) then
+            debugPrint("Inventory near full ("..used.."), requesting empty")
+            modem.transmit(10, 11, "needempty")
+            broadcastState.enabled = true
+            coordBroadcastInterval = 1
+            lastNeedEmpty = os.time()
+        end
+
+        -- if we have enough fuel again, slow broadcasts back down
+        if fl >= (fuelCheckThreshold + 50) then
+            coordBroadcastInterval = 5
+        end
+
+        sleep(1)
+    end
+end
+
+-- MAIN mining loop (placeholder - you said you will handle the rest; keep it simple)
+local function mainProgram()
+    local steps = 0
+    while true do
+        -- example mine-forward pattern for 3x3: attempt center forward, dig up/down etc.
+        -- You already have your detailed miner; wire this hook into your logic instead.
+        if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < 1 then
+            debugPrint("No fuel to move. Waiting.")
+            sleep(2)
+        else
+            -- perform a move (very simple)
+            safeForward()
+            steps = steps + 1
+            debugPrint("mined step", steps)
+        end
+        sleep(0.2)
+    end
+end
+
+-- run everything
+parallel.waitForAny(mainProgram, manualSender, receiver, autoMonitor, broadcaster)

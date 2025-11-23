@@ -1,0 +1,323 @@
+-- support_b.lua  (Turtle B - Chunky / Follower)
+-- Paste on the chunky turtle
+
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached") end
+modem.open(10) -- listen to miner broadcasts / requests
+modem.open(11) -- listen for responses channel (miner reads here)
+
+local gps = gps
+
+-- CONFIG
+local gpsTimeout = 2
+local maxGpsRetries = 3
+local followPollInterval = 2      -- seconds between follow attempts when idle
+local approachDistance = 1        -- how close to get to miner (1 block)
+local moveAttemptTimeout = 25     -- seconds to reach a given coordinate before abort
+local stuckThreshold = 6          -- no position change checks
+local supportFuelAmt = 5          -- amount of fuel items to pass (per interaction)
+
+-- UTILS
+local function debugPrint(...) print("[B]", ...) end
+
+local function getPos()
+    for i = 1, maxGpsRetries do
+        local x,y,z = gps.locate(gpsTimeout)
+        if x then return x,y,z end
+        sleep(0.2)
+    end
+    return nil
+end
+
+local function distance(a,b)
+    return math.abs(a.x-b.x) + math.abs(a.y-b.y) + math.abs(a.z-b.z)
+end
+
+-- movement helpers (defensive)
+local function safeForward()
+    local tries = 0
+    while turtle.detect() and tries < 8 do
+        turtle.dig()
+        sleep(0.05)
+        tries = tries + 1
+    end
+    return turtle.forward()
+end
+local function safeUp()
+    while turtle.detectUp() do turtle.digUp(); sleep(0.05) end
+    return turtle.up()
+end
+local function safeDown()
+    while turtle.detectDown() do turtle.digDown(); sleep(0.05) end
+    return turtle.down()
+end
+
+-- rotate helpers (we will attempt small moves and revert if they don't help)
+local function tryMoveDirection(turns) -- turns: -1 left, 0 forward, 1 right, 2 back
+    -- rotate to direction
+    if turns == -1 then turtle.turnLeft()
+    elseif turns == 1 then turtle.turnRight()
+    elseif turns == 2 then turtle.turnLeft(); turtle.turnLeft() end
+
+    local ok = safeForward()
+    -- rotate back to original orientation
+    if turns == -1 then turtle.turnRight()
+    elseif turns == 1 then turtle.turnLeft()
+    elseif turns == 2 then turtle.turnLeft(); turtle.turnLeft() end
+
+    return ok
+end
+
+-- moveTowards: tries small horizontal step that reduces distance to target (uses GPS to confirm)
+local function moveTowards(target, timeout)
+    timeout = timeout or moveAttemptTimeout
+    local start = os.time()
+    local lastPos = getPos()
+    if not lastPos then return false, "no-gps" end
+    lastPos = {x=lastPos, y=select(2,lastPos), z=select(3,lastPos)} -- but that's messy - fix below
+end
+
+-- We'll write a more robust goTo that tests moves and reverts if they fail to reduce dist.
+local function goTo(target)
+    -- target is table {x=, y=, z=}
+    local startTime = os.time()
+    local stuckCounter = 0
+    local lastPos = getPos()
+    if not lastPos then return false, "no-gps" end
+    lastPos = { x=lastPos, y=select(2, getPos()), z=select(3, getPos()) } -- safe fallback
+
+    local function getCur()
+        local x,y,z = getPos()
+        if not x then return nil end
+        return {x=x,y=y,z=z}
+    end
+
+    local function horizStepTowards(cur, targ)
+        local best = nil
+        local bestDist = distance(cur, targ)
+        -- attempts: forward (0), left (-1), right (1), back (2)
+        local attempts = {0, -1, 1, 2}
+        for _, t in ipairs(attempts) do
+            -- rotate to direction
+            if t == -1 then turtle.turnLeft()
+            elseif t == 1 then turtle.turnRight()
+            elseif t == 2 then turtle.turnLeft(); turtle.turnLeft() end
+
+            -- try forward, then read GPS
+            local moved = safeForward()
+            local x,y,z = getPos()
+            local newPos
+            if x then newPos = {x=x,y=y,z=z} end
+
+            -- rotate back to original orientation (we want to preserve heading for next attempt)
+            if t == -1 then turtle.turnRight()
+            elseif t == 1 then turtle.turnLeft()
+            elseif t == 2 then turtle.turnLeft(); turtle.turnLeft() end
+
+            if moved and newPos then
+                local nd = distance(newPos, targ)
+                if nd < bestDist then
+                    return true, newPos
+                else
+                    -- revert: step back
+                    turtle.back()
+                end
+            else
+                -- if we couldn't move, leave it
+            end
+        end
+        return false, nil
+    end
+
+    -- vertical moves: do them directly (try to match y first)
+    while true do
+        if os.time() - startTime > moveAttemptTimeout then return false, "timeout" end
+        local cur = getCur()
+        if not cur then return false, "no-gps" end
+        if cur.x == target.x and cur.y == target.y and cur.z == target.z then
+            return true
+        end
+
+        -- If Y differs, try up/down first
+        if cur.y < target.y then
+            local ok = safeUp()
+            if not ok then
+                -- try to clear and retry
+                turtle.digUp()
+                safeUp()
+            end
+            sleep(0.05)
+        elseif cur.y > target.y then
+            local ok = safeDown()
+            if not ok then
+                -- maybe digDown and retry
+                turtle.digDown()
+                safeDown()
+            end
+            sleep(0.05)
+        else
+            -- horizontal step
+            local ok, newPos = horizStepTowards(cur, target)
+            if ok then
+                -- moved to a better position
+                sleep(0.05)
+            else
+                -- try a small climb to avoid obstacle
+                if safeUp() then
+                    sleep(0.05)
+                    local cur2 = getCur()
+                    if cur2 and distance(cur2, target) < distance(cur, target) then
+                        -- good
+                    else
+                        -- move back down if it didn't help
+                        safeDown()
+                    end
+                else
+                    -- if can't move, try to dig forward and retry
+                    turtle.dig()
+                    sleep(0.1)
+                end
+            end
+        end
+        sleep(0.05)
+    end
+end
+
+-- Support actions
+local function giveFuelToMiner()
+    debugPrint("Giving fuel: dropping", supportFuelAmt, "items forward")
+    -- pass up to supportFuelAmt coal-like items
+    local given = 0
+    for s=1,16 do
+        if given >= supportFuelAmt then break end
+        local d = turtle.getItemDetail(s)
+        if d and d.name then
+            if string.find(d.name, "coal") or string.find(d.name, "charcoal") then
+                turtle.select(s)
+                turtle.drop(supportFuelAmt) -- drop some from slot
+                given = given + d.count
+                if given >= supportFuelAmt then break end
+            end
+        end
+    end
+    -- notify miner
+    modem.transmit(10,11,"fuelready")
+    debugPrint("Sent fuelready")
+end
+
+local function takeItemsFromMiner()
+    debugPrint("Preparing to receive items from miner")
+    -- request miner to drop
+    modem.transmit(10,11,"readyToReceive")
+    sleep(0.2)
+    -- we will suck several times
+    local tries = 4
+    for i=1,tries do
+        turtle.suck()
+        sleep(0.2)
+    end
+    modem.transmit(10,11,"emptyed")
+    debugPrint("Empty transfer attempted")
+end
+
+-- state
+local lastMinerCoords = nil
+local mission = nil -- nil or "fuel" or "empty" or "follow"
+
+-- receiver: listens for miner messages
+local function receiver()
+    while true do
+        local event, side, channel, reply, msg, dist = os.pullEvent("modem_message")
+        -- handle structured tables or strings
+        if type(msg) == "table" and msg.tag == "here" then
+            local t = { x = msg.x, y = msg.y, z = msg.z }
+            lastMinerCoords = t
+            -- if we are in follow mode, go to it aggressively
+            if mission == "follow" or mission == "idle" or mission == nil then
+                mission = "follow"
+            end
+        elseif type(msg) == "string" then
+            if msg == "needfuel" then
+                debugPrint("Miner requested fuel. Starting mission.")
+                mission = "fuel"
+            elseif msg == "needempty" then
+                debugPrint("Miner requested empty. Starting disk mission.")
+                mission = "empty"
+            elseif msg == "getfuel" then
+                -- manual request from miner; do immediate give
+                debugPrint("Manual getfuel received; giving fuel now")
+                giveFuelToMiner()
+            elseif msg == "ping" then
+                -- ignore
+            else
+                debugPrint("MSG str:", msg)
+            end
+        end
+    end
+end
+
+-- follower loop: when mission==fuel/empty, navigate to miner and operate; when mission==follow keep following coords
+local function follower()
+    while true do
+        if mission == "fuel" and lastMinerCoords then
+            debugPrint("Going to miner to give fuel at", lastMinerCoords.x, lastMinerCoords.y, lastMinerCoords.z)
+            local ok, err = goTo(lastMinerCoords)
+            if ok then
+                -- approach (if needed) by stepping closer until within approachDistance
+                debugPrint("Arrived - attempting approach and give fuel")
+                giveFuelToMiner()
+            else
+                debugPrint("Failed to reach miner:", err)
+            end
+            -- after service, switch to follow mode
+            mission = "follow"
+        elseif mission == "empty" and lastMinerCoords then
+            debugPrint("Going to miner to take items at", lastMinerCoords.x, lastMinerCoords.y, lastMinerCoords.z)
+            local ok, err = goTo(lastMinerCoords)
+            if ok then
+                takeItemsFromMiner()
+            else
+                debugPrint("Failed to reach miner:", err)
+            end
+            mission = "follow"
+        elseif mission == "follow" and lastMinerCoords then
+            -- try to stay within 1 block of miner
+            local ok, err = goTo(lastMinerCoords)
+            if not ok then debugPrint("Follow goTo error:", err) end
+            -- wait a bit; miner will broadcast new coords
+            sleep(followPollInterval)
+        else
+            -- idle: wait for broadcasts/requests
+            mission = mission or "idle"
+            sleep(1)
+        end
+    end
+end
+
+-- manual sender: allow manual commands from you at B
+local function manualSender()
+    while true do
+        write("B> ")
+        local t = read()
+        if t == "goto" then
+            print("Enter X Y Z:")
+            local s = read()
+            local x,y,z = s:match("(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)")
+            if x then
+                goTo({x=tonumber(x), y=tonumber(y), z=tonumber(z)})
+            else
+                print("Bad coords")
+            end
+        elseif t == "givefuel" then
+            giveFuelToMiner()
+        elseif t == "takeitems" then
+            takeItemsFromMiner()
+        else
+            -- generic message to miner
+            modem.transmit(10,11,t)
+        end
+    end
+end
+
+-- run
+parallel.waitForAny(receiver, follower, manualSender)

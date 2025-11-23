@@ -1,0 +1,565 @@
+-- drawie_main.lua
+-- Controller for "Drawie" turtle using A.* movement API.
+
+----------------------------
+-- LOGGING
+----------------------------
+
+local debugsw = true    -- print to local console
+local commsw  = true    -- send over rednet
+local compID  = 3       -- remote log computer id
+
+local function log(msg)
+  local timestamp = os.date("%H:%M:%S")
+  local final = "[" .. timestamp .. "] " .. msg
+
+  if debugsw then
+    print(final)
+  end
+
+  if commsw and rednet then
+    pcall(function()
+      rednet.send(compID, { log = final }, "stats")
+    end)
+  end
+end
+
+----------------------------
+-- CONFIG
+----------------------------
+
+local DB_PATH = "DESTINATION"   -- your real DB file
+
+-- Directions (match A API: 0=N, 1=W, 2=S, 3=E)
+local DIR_N, DIR_W, DIR_S, DIR_E = 0, 1, 2, 3
+
+-- Lighthouse network
+local LIGHTHOUSES = {
+  { n = "L1", x = 20, y = 4, z = -17, d = DIR_E },  -- was L2
+  { n = "L2", x = 13, y = 4, z = -18, d = DIR_W },  -- was L3
+  { n = "L3", x = 9,  y = 2, z = -20, d = DIR_W },  -- was L4
+  { n = "L4", x = 6,  y = 3, z = -20, d = DIR_N },  -- was L5
+  { n = "L5", x = 6,  y = 4, z = -26, d = DIR_N },  -- was L6
+}
+
+----------------------------
+-- SOURCE DRAWERS (draw2 – 12 slots)
+----------------------------
+-- From your table:
+-- 3 rows × 4 columns
+-- X: 3–6, Y: 4–2, Z: -27, facing north
+
+local SRC_BASE_X   = 3
+local SRC_BASE_Y   = 4
+local SRC_BASE_Z   = -27
+local SRC_ROWS     = 3
+local SRC_COLS     = 4
+local SRC_FACING   = DIR_N
+local SRC_MAX_SLOT = SRC_ROWS * SRC_COLS  -- 12
+
+----------------------------
+-- DESTINATION DRAWERS (draw1 – 40 slots)
+----------------------------
+-- From your DB:
+-- 5 rows × 8 columns
+-- Slot 1: x=21, y=4, z=-17
+-- Slot 8: x=21, y=4, z=-24
+-- Z decreases to the right
+-- Drawers face WEST
+
+local DEST_X        = 21
+local DEST_BASE_Y   = 4
+local DEST_ROWS     = 5
+local DEST_COLS     = 8
+local DEST_BASE_Z   = -17       -- top-left Z
+local DEST_FACING   = DIR_W
+local DEST_MAX_SLOT = DEST_ROWS * DEST_COLS   -- 40
+
+-- Fuel
+local MIN_FUEL = 2000
+
+-- Heartbeat
+local HEARTBEAT_INTERVAL = 5
+local HEARTBEAT_TARGET   = 3   -- same as compID, adjust if needed
+local HEARTBEAT_PROTOCOL = "DRAWIE_STATUS"
+
+----------------------------
+-- STATE
+----------------------------
+
+local CURRENT_PHASE = "startup"
+
+-- Destination DB state:
+-- destSlots[index] = { item = "...", max = 0 }
+-- itemToSlot["minecraft:raw_copper"] = index
+local destSlots  = {}
+local itemToSlot = {}
+
+----------------------------
+-- UTILS
+----------------------------
+
+local function setPhase(phase)
+  CURRENT_PHASE = phase
+  log("[PHASE] " .. phase)
+end
+
+local function invertDir(d)
+  return (d + 2) % 4
+end
+
+local function isInventoryFull()
+  for i = 1, 16 do
+    local detail = turtle.getItemDetail(i)
+    if not detail then
+      return false
+    end
+    if turtle.getItemSpace(i) > 0 then
+      return false
+    end
+  end
+  return true
+end
+
+local function hasAnyItems()
+  for i = 1, 16 do
+    if turtle.getItemCount(i) > 0 then
+      return true
+    end
+  end
+  return false
+end
+
+local function selectFirstFuelSlot()
+  for i = 1, 16 do
+    local d = turtle.getItemDetail(i)
+    if d and d.name then
+      if string.find(d.name, "coal") or string.find(d.name, "lava") then
+        turtle.select(i)
+        return true
+      end
+    end
+  end
+  return false
+end
+
+----------------------------
+-- DESTINATION DB
+----------------------------
+
+-- Your DB file format:
+-- # slot item max x y z dir
+-- 5 minecraft:raw_copper 0 21 4 -21 1
+local function loadDestinationDB()
+  destSlots  = {}
+  itemToSlot = {}
+
+  if not fs.exists(DB_PATH) then
+    log("[DB] No existing DB, starting fresh")
+    return
+  end
+
+  local f = fs.open(DB_PATH, "r")
+  if not f then
+    log("[DB] Failed to open DB: " .. DB_PATH)
+    return
+  end
+
+  while true do
+    local line = f.readLine()
+    if not line then break end
+
+    line = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if line ~= "" and not line:match("^#") then
+      local slotStr, item, maxStr = line:match("^(%d+)%s+(%S+)%s+(%d+)")
+      local slot = tonumber(slotStr)
+      local max  = tonumber(maxStr)
+
+      if slot and item then
+        destSlots[slot] = { item = item, max = max }
+        if item ~= "-" then
+          itemToSlot[item] = slot
+        end
+      end
+    end
+  end
+
+  f.close()
+  log("[DB] Loaded destination DB")
+end
+
+local function getDestSlotCoords(index)
+  if index < 1 or index > DEST_MAX_SLOT then
+    error("Invalid destination slot index: " .. tostring(index))
+  end
+
+  local row = math.floor((index - 1) / DEST_COLS)   -- 0..4
+  local col = (index - 1) % DEST_COLS               -- 0..7
+
+  local x = DEST_X
+  local y = DEST_BASE_Y - row
+  local z = DEST_BASE_Z - col   -- Z decreases to the right
+
+  return x, y, z, DEST_FACING
+end
+
+local function saveDestinationDB()
+  local f = fs.open(DB_PATH, "w")
+  if not f then
+    log("[DB] ERROR: cannot save DB")
+    return
+  end
+
+  f.writeLine("# slot item max x y z dir")
+  for idx = 1, DEST_MAX_SLOT do
+    local rec  = destSlots[idx]
+    local item = rec and rec.item or "-"
+    local max  = rec and rec.max or 0
+
+    local x, y, z, d = getDestSlotCoords(idx)
+    f.writeLine(string.format("%d %s %d %d %d %d %d",
+      idx, item, max, x, y, z, d))
+  end
+
+  f.close()
+  log("[DB] Saved destination DB")
+end
+
+local function findFreeDestSlot()
+  for i = 1, DEST_MAX_SLOT do
+    local rec = destSlots[i]
+    if not rec or rec.item == "-" or rec.item == nil then
+      return i
+    end
+  end
+  return nil
+end
+
+----------------------------
+-- SOURCE SLOTS
+----------------------------
+
+local function getSourceSlotCoords(index)
+  if index < 1 or index > SRC_MAX_SLOT then
+    error("Invalid source slot index: " .. tostring(index))
+  end
+
+  local row = math.floor((index - 1) / SRC_COLS)   -- 0..2
+  local col = (index - 1) % SRC_COLS               -- 0..3
+
+  local x = SRC_BASE_X + col
+  local y = SRC_BASE_Y - row
+  local z = SRC_BASE_Z
+
+  return x, y, z, SRC_FACING
+end
+
+----------------------------
+-- LIGHTHOUSES / ROUTING
+----------------------------
+
+local function findLighthouseByName(name)
+  for i, lh in ipairs(LIGHTHOUSES) do
+    if lh.n == name then
+      return lh, i
+    end
+  end
+  return nil, nil
+end
+
+local function goToLighthouse(name)
+  local lh = findLighthouseByName(name)
+  if not lh then
+    error("Unknown lighthouse: " .. tostring(name))
+  end
+  log(string.format("[LH] Going to %s @ (%d,%d,%d) dir=%d", lh.n, lh.x, lh.y, lh.z, lh.d))
+  A.moveTo(lh.x, lh.y, lh.z, lh.d, true)
+end
+
+local function routeL1ToL5()
+  log("[LH] Route L1 -> L5")
+  local order = { "L1", "L2", "L3", "L4", "L5" }
+  for i = 2, #order do
+    local lh = findLighthouseByName(order[i])
+    A.moveTo(lh.x, lh.y, lh.z, lh.d, true)
+  end
+end
+
+local function routeL5ToL1()
+  log("[LH] Route L5 -> L1 (invert d)")
+  local order = { "L5", "L4", "L3", "L2", "L1" }
+  for i = 2, #order do
+    local lh  = findLighthouseByName(order[i])
+    local dir = invertDir(lh.d)
+    A.moveTo(lh.x, lh.y, lh.z, dir, true)
+  end
+end
+
+----------------------------
+-- REFUEL
+----------------------------
+
+local function ensureFuel()
+  local fuel = turtle.getFuelLevel()
+  if fuel == "unlimited" then
+    return
+  end
+  if fuel >= MIN_FUEL then
+    return
+  end
+
+  log("[FUEL] Low fuel (" .. tostring(fuel) .. "), attempting refuel")
+  if selectFirstFuelSlot() then
+    local ok, err = pcall(function() turtle.refuel() end)
+    if not ok then
+      log("[FUEL] Refuel failed: " .. tostring(err))
+    else
+      log("[FUEL] New fuel level: " .. turtle.getFuelLevel())
+    end
+  else
+    log("[FUEL] No fuel items found in inventory!")
+  end
+end
+
+----------------------------
+-- PICKUP PHASE
+----------------------------
+
+local function pickupPhase()
+  setPhase("pickup")
+  log("[PICKUP] Starting pickup phase from source drawers")
+
+  for slotIndex = 1, SRC_MAX_SLOT do
+    if isInventoryFull() then
+      log("[PICKUP] Inventory full, stopping pickup")
+      return
+    end
+
+    local x, y, z, dir = getSourceSlotCoords(slotIndex)
+    log(string.format("[PICKUP] Going to source slot %d @ (%d,%d,%d)", slotIndex, x, y, z))
+    A.moveTo(x, y, z, dir, true)
+
+    while not isInventoryFull() do
+      local ok = turtle.suck()
+      if not ok then
+        break
+      end
+    end
+  end
+
+  log("[PICKUP] Finished scanning all source drawers")
+end
+
+----------------------------
+-- DEPOSIT PHASE (DELAYED COMMIT + DEBUG)
+----------------------------
+
+local function depositInventory()
+  setPhase("deposit")
+  log("[DEPOSIT] Starting deposit phase")
+
+  while hasAnyItems() do
+    for invSlot = 1, 16 do
+      local detail = turtle.getItemDetail(invSlot)
+      if detail and detail.count > 0 then
+        local itemName = detail.name
+
+        -- Resolve slot: existing or first free, BUT do not commit DB yet
+        local destIdx = itemToSlot[itemName] or findFreeDestSlot()
+        if not destIdx then
+          log("[DEPOSIT] No destination slot for " .. itemName .. ", skipping")
+        else
+          local dx, dy, dz, ddir = getDestSlotCoords(destIdx)
+
+          log(string.format("[DEPOSIT] Preparing to place %s from invSlot %d into destIdx %d @ (%d,%d,%d) dir=%d",
+            itemName, invSlot, destIdx, dx, dy, dz, ddir))
+
+          A.moveTo(dx, dy, dz, ddir, true)
+          turtle.select(invSlot)
+
+          local before = turtle.getItemDetail(invSlot)
+          local beforeCount = before and before.count or 0
+
+          log("----------------------------------------------------")
+          log("[DEPOSIT] Attempting insert")
+          log(" item        = " .. itemName)
+          log(" invSlot     = " .. invSlot)
+          log(" destIdx     = " .. destIdx)
+          log(string.format(" coords      = %d %d %d", dx, dy, dz))
+          log(" facing dir  = " .. ddir)
+          log(" items_before= " .. beforeCount)
+
+          local okInspect, data = turtle.inspect()
+          if okInspect and data and data.name then
+            log(" FRONT BLOCK = " .. data.name)
+          else
+            log(" FRONT BLOCK = <none>")
+          end
+
+          local isDrawer = (okInspect and data and data.name and data.name:find("drawer"))
+          local dropAttempted = false
+
+          if isDrawer then
+            dropAttempted = true
+            turtle.drop()
+          else
+            if itemToSlot[itemName] == nil then
+              log("[DEPOSIT][WARN] Unassigned DB entry, forcing drop anyway for init: " .. itemName)
+              dropAttempted = true
+              turtle.drop()
+            else
+              log("[DEPOSIT][WARN] Front is NOT drawer for assigned item, NOT dropping: " .. itemName)
+            end
+          end
+
+          local after = turtle.getItemDetail(invSlot)
+          local afterCount = after and after.count or 0
+
+          log(" drop_attempted = " .. tostring(dropAttempted))
+          log(" items_after    = " .. afterCount)
+
+          local dropSuccess = (dropAttempted and afterCount < beforeCount)
+
+          if dropSuccess then
+            log("[DEPOSIT][OK] Drop successful for " .. itemName)
+          elseif dropAttempted then
+            log("[DEPOSIT][FAIL] Drop attempted but no change for " .. itemName)
+          else
+            log("[DEPOSIT][SKIP] No drop attempted for " .. itemName)
+          end
+          log("----------------------------------------------------")
+
+          -- COMMIT TO DB ONLY IF DROP SUCCEEDED
+          if dropSuccess then
+            if itemToSlot[itemName] ~= destIdx then
+              log("[DEPOSIT] COMMIT DB: " .. itemName .. " -> slot " .. destIdx)
+              itemToSlot[itemName] = destIdx
+              destSlots[destIdx]   = destSlots[destIdx] or {}
+              destSlots[destIdx].item = itemName
+              saveDestinationDB()
+            end
+          else
+            log("[DEPOSIT] NOT committing " .. itemName .. " to DB (drop not confirmed)")
+          end
+        end
+      end
+    end
+
+    sleep(0)
+  end
+
+  log("[DEPOSIT] Deposit phase complete")
+end
+
+----------------------------
+-- HEARTBEAT LOOP
+----------------------------
+
+local function heartbeatLoop()
+  while true do
+    local status = {
+      src   = "DRAWIE_MAIN",
+      time  = os.date("%H:%M:%S"),
+      phase = CURRENT_PHASE,
+      fuel  = turtle.getFuelLevel(),
+      invFull = isInventoryFull(),
+      pos = {
+        x   = A and A.cachedX,
+        y   = A and A.cachedY,
+        z   = A and A.cachedZ,
+        dir = A and A.cachedDir
+      }
+    }
+
+    if rednet and rednet.isOpen then
+      pcall(function()
+        if rednet.isOpen() then
+          rednet.send(HEARTBEAT_TARGET, status, HEARTBEAT_PROTOCOL)
+        end
+      end)
+    end
+
+    sleep(HEARTBEAT_INTERVAL)
+  end
+end
+
+----------------------------
+-- MAIN LOOP
+----------------------------
+
+local function mainLoop()
+  while true do
+    setPhase("refuel")
+    ensureFuel()
+
+    setPhase("goto_L1")
+    goToLighthouse("L1")
+
+    setPhase("route_L1_L5")
+    routeL1ToL5()
+
+    pickupPhase()
+
+    setPhase("goto_L5")
+    goToLighthouse("L5")
+
+    setPhase("route_L5_L1")
+    routeL5ToL1()
+
+    depositInventory()
+  end
+end
+
+----------------------------
+-- STARTUP
+----------------------------
+
+local function startup()
+  setPhase("startup")
+
+  -- Try to load A if not already
+  if not A then
+    if fs.exists("apis/A") then
+      os.loadAPI("apis/A")
+    elseif fs.exists("A") then
+      os.loadAPI("A")
+    elseif fs.exists("A.lua") then
+      os.loadAPI("A.lua")
+    end
+  end
+
+  if not A then
+    error("Movement API 'A' not found")
+  end
+
+  -- Open rednet if possible (for logging)
+  if rednet and peripheral then
+    local opened = false
+    for _, side in ipairs({"left","right","top","bottom","front","back"}) do
+      if peripheral.getType(side) == "modem" then
+        if not rednet.isOpen(side) then
+          pcall(function() rednet.open(side) end)
+        end
+        opened = true
+        break
+      end
+    end
+    if not opened then
+      log("[NET] No modem found for rednet logging")
+    end
+  end
+
+  loadDestinationDB()
+
+  A.startGPS()
+  A.setLocationFromGPS()
+
+  log("[STARTUP] Complete")
+end
+
+----------------------------
+-- ENTRY POINT
+----------------------------
+
+startup()
+parallel.waitForAny(heartbeatLoop, mainLoop)

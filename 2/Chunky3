@@ -1,0 +1,219 @@
+-- === CONFIG ===
+local minFuel = 10
+local hopInterval = 2
+local fuelItems = {
+    "minecraft:coal",
+    "minecraft:charcoal",
+    "minecraft:coal_block"
+}
+
+-- === STATE ===
+local path = {}   -- movement history
+
+-- === UTILS ===
+
+----------------------------------------------------------------
+-- Pull fuel from RIGHT chest
+----------------------------------------------------------------
+local function suckFuelFromRight()
+    print("Pulling fuel from right chest...")
+    turtle.turnRight()
+    local pulled = turtle.suck()   -- pulls 1 stack if available
+    turtle.turnLeft()
+
+    if pulled then
+        print("Pulled fuel from chest!")
+        return true
+    else
+        print("No fuel in right chest!")
+        return false
+    end
+end
+
+----------------------------------------------------------------
+-- Refuels from inventory OR pulls from right chest if empty
+----------------------------------------------------------------
+local function refuelIfNeeded()
+    if turtle.getFuelLevel() > minFuel then return end
+
+    print("Refueling...")
+
+    -- Try consuming existing fuel first
+    for slot = 1, 16 do
+        local detail = turtle.getItemDetail(slot)
+        if detail then
+            for _, item in ipairs(fuelItems) do
+                if detail.name == item then
+                    turtle.select(slot)
+                    turtle.refuel(1)
+                    print(" +1 fuel (" .. turtle.getFuelLevel() .. ")")
+                    if turtle.getFuelLevel() > minFuel then return end
+                end
+            end
+        end
+    end
+
+    -- Try pulling from right chest
+    print("Inventory empty, checking chest...")
+    if suckFuelFromRight() then
+        return refuelIfNeeded() -- retry with new fuel
+    end
+
+    -- Chest ALSO empty ? return home
+    print("!!! OUT OF FUEL ? RETURNING HOME !!!")
+    returnHome()
+end
+
+----------------------------------------------------------------
+-- Netherrack detection
+----------------------------------------------------------------
+local function detectNetherrack()
+    local checks = {
+        turtle.inspect,
+        turtle.inspectUp,
+        turtle.inspectDown
+    }
+
+    for _, fn in ipairs(checks) do
+        local ok, data = fn()
+        if ok and data and data.name == "minecraft:netherrack" then
+            print("!!! NETHERRACK FOUND !!!")
+            return true
+        end
+    end
+
+    return false
+end
+
+----------------------------------------------------------------
+-- Movement wrappers that log path
+----------------------------------------------------------------
+local function loggedForward()
+    turtle.forward()
+    table.insert(path, "forward")
+end
+
+local function loggedUp()
+    turtle.up()
+    table.insert(path, "up")
+end
+
+local function loggedDown()
+    turtle.down()
+    table.insert(path, "down")
+end
+
+----------------------------------------------------------------
+-- Return home by reversing path
+----------------------------------------------------------------
+function returnHome()
+    print("Returning home...")
+
+    for i = #path, 1, -1 do
+        local move = path[i]
+
+        if move == "forward" then
+            turtle.back()
+        elseif move == "up" then
+            turtle.down()
+        elseif move == "down" then
+            turtle.up()
+        end
+
+        sleep(0.1)
+    end
+
+    print("Home reached.")
+    while true do sleep(1) end
+end
+
+----------------------------------------------------------------
+-- Safe forward (waits until clear)
+----------------------------------------------------------------
+local function safeForward()
+    while turtle.detect() do
+        print("Block in front, waiting...")
+        sleep(0.2)
+    end
+    loggedForward()
+end
+
+----------------------------------------------------------------
+-- Hop movement
+----------------------------------------------------------------
+local function hop()
+    if turtle.detectUp() then turtle.digUp() end
+    loggedUp()
+
+    safeForward()
+
+    if turtle.detectDown() then turtle.digDown() end
+    loggedDown()
+end
+
+local function redstone()
+	-- FRONT
+    if detectedTurtleInFront() then
+        pulse("front")
+        return true
+    end
+
+    -- LEFT
+    if detectedTurtleLeft() then
+        pulse("left")
+        return true
+    end
+
+    -- RIGHT
+    if detectedTurtleRight() then
+        pulse("right")
+        return true
+    end
+
+    -- UP
+    if detectedTurtleUp() then
+        pulse("top")
+        return true
+    end
+
+    -- DOWN
+    if detectedTurtleDown() then
+        pulse("bottom")
+        return true
+    end
+
+    return false
+end
+
+local function pulse(side)
+    print("Moving back pulse on :", side)
+    turtle.backward()
+	sleep(3)
+end
+		
+
+-- === MAIN LOOP ===
+local steps = 0
+print("Starting chunky movement...")
+
+while true do
+    refuelIfNeeded()
+
+    if detectNetherrack() then
+        returnHome()
+    end
+	
+	redstone()
+	
+    steps = steps + 1
+    print("Step " .. steps)
+
+    if steps % hopInterval == 0 then
+        print("Hop...")
+        hop()
+    else
+        safeForward()
+    end
+
+    sleep(0.1)
+end

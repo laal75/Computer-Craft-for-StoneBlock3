@@ -1,0 +1,589 @@
+-- ==========================
+-- Drawie v3 — Full Rewrite
+-- Drawer-to-drawer sorter using A.lua + Lighthouses
+-- ==========================
+
+os.loadAPI("apis/A")
+
+-- ==========================
+-- DEBUG SWITCH
+-- ==========================
+local DEBUG = false  -- Set true for extra logs
+
+----------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------
+
+-- Directions (must match A.lua)
+local DIR_N = 0
+local DIR_W = 1
+local DIR_S = 2
+local DIR_E = 3
+
+-- DESTINATION DRAWERS (sorted wall)
+-- Drawer blocks: 21,0,17  -> 21,4,24
+-- Turtle stands 1 block in front (x-1), facing East
+local destBase = {
+    x   = 20,   -- in front of drawer at x=21
+    y   = 0,    -- bottom row
+    z   = 17,   -- first column
+    dir = DIR_E -- facing the wall
+}
+local DEST_ROWS = 5  -- y: 0..4
+local DEST_COLS = 8  -- z: 17..24
+
+-- SOURCE DRAWERS (input wall)
+-- Interpreting your coords:
+-- Drawer blocks: approx 3,0,27 -> 6,2,27 (3 rows x 4 columns)
+-- Turtle stands 1 block in front (x-1), facing East
+local srcBase = {
+    x   = 2,    -- in front of x=3
+    y   = 0,    -- bottom row
+    z   = 27,   -- constant z
+    dir = DIR_E -- facing the wall
+}
+local SRC_ROWS = 3  -- 3 high
+local SRC_COLS = 4  -- 4 wide
+
+-- Networking / monitor
+local modemSide    = "right"
+local monitorID    = 3
+local DRAWIE_PROTO = "DRAWIE_STATUS"
+
+----------------------------------------------------------
+-- LOGGING
+----------------------------------------------------------
+
+local function log(msg)
+    local ts = os.date("%H:%M:%S")
+    local line = "[" .. ts .. "] " .. msg
+    print(line)
+    if rednet and monitorID and DRAWIE_PROTO then
+        pcall(function()
+            rednet.send(monitorID, { log = line }, DRAWIE_PROTO)
+        end)
+    end
+end
+
+local function dbg(msg)
+    if DEBUG then
+        log("[DBG] " .. msg)
+    end
+end
+
+local function posToString()
+    if A.pos then
+        return string.format("(%s,%s,%s) dir=%s",
+            tostring(A.pos.x or "?"),
+            tostring(A.pos.y or "?"),
+            tostring(A.pos.z or "?"),
+            tostring(A.pos.dir or "?"))
+    end
+    return "(nil) dir=nil"
+end
+
+----------------------------------------------------------
+-- DB FILE
+----------------------------------------------------------
+
+local DB_FILE = "drawie_db.txt"
+
+local drawerDB = {
+    destination = {}  -- [idx] = {item,count,x,y,z,dir}
+}
+
+-- SORT LOGIC / DB MAPPING (moved up for function order)
+local itemSlot = {}
+local nextFree = 1
+
+local function rebuildItemSlotIndex()
+    itemSlot = {}
+    nextFree = 1
+    for idx, v in pairs(drawerDB.destination) do
+        itemSlot[v.item] = idx
+        if idx >= nextFree then
+            nextFree = idx + 1
+        end
+    end
+end
+
+-- DB FILE
+
+local function saveDrawerDB()
+    local f = fs.open(DB_FILE, "w")
+    if not f then return end
+
+    f.writeLine("DESTINATION")
+    for idx, d in pairs(drawerDB.destination) do
+        f.writeLine(string.format(
+            "%d %s %d %d %d %d %d",
+            idx,
+            d.item or "unknown",
+            d.count or 0,
+            d.x or 0,
+            d.y or 0,
+            d.z or 0,
+            d.dir or 0
+        ))
+    end
+
+    f.close()
+    rebuildItemSlotIndex()
+end
+
+local function loadDrawerDB()
+    if not fs.exists(DB_FILE) then
+        drawerDB.destination = {}
+        itemSlot = {}
+        nextFree = 1
+        return
+    end
+
+    local f = fs.open(DB_FILE, "r")
+    if not f then return end
+
+    drawerDB.destination = {}
+    local mode
+
+    while true do
+        local line = f.readLine()
+        if not line then break end
+        line = line:match("^%s*(.-)%s*$")
+        if line == "DESTINATION" then
+            mode = "destination"
+        elseif mode and line ~= "" then
+            local idx, name, count, x, y, z, dir =
+                line:match("^(%d+)%s+(%S+)%s+(%d+)%s+(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)$")
+            if idx then
+                idx = tonumber(idx)
+                drawerDB.destination[idx] = {
+                    item  = name,
+                    count = tonumber(count),
+                    x     = tonumber(x),
+                    y     = tonumber(y),
+                    z     = tonumber(z),
+                    dir   = tonumber(dir)
+                }
+            end
+        end
+    end
+
+    f.close()
+    rebuildItemSlotIndex()
+end
+
+----------------------------------------------------------
+-- NETWORK / HEARTBEAT
+----------------------------------------------------------
+
+if not rednet.isOpen(modemSide) then
+    pcall(function()
+        rednet.open(modemSide)
+    end)
+end
+
+local function heartbeat(status)
+    local x, y, z, dir = A.getLocation()
+    if not x then
+        A.startGPS()
+        x, y, z, dir = A.setLocationFromGPS()
+    end
+    rednet.send(monitorID, {
+        heartbeat = true,
+        status    = status or "RUN",
+        time      = os.date("%H:%M:%S")
+    }, DRAWIE_PROTO)
+end
+
+----------------------------------------------------------
+-- LIGHTHOUSE NAVIGATION
+----------------------------------------------------------
+
+local lighthouses = {
+    { n = "L1", x = 20, y = 4, z = -17, d = DIR_E },  -- was L2
+    { n = "L2", x = 13, y = 4, z = -18, d = DIR_W },  -- was L3
+    { n = "L3", x = 9,  y = 2, z = -20, d = DIR_W },  -- was L4
+    { n = "L4", x = 6,  y = 3, z = -20, d = DIR_N },  -- was L5
+    { n = "L5", x = 6,  y = 4, z = -26, d = DIR_N },  -- was L6
+}
+
+local function GotoL5(s)
+    -- Move along chain: L1 -> L2 -> L3 -> L4 -> L5
+    if s == "L1" then
+        log("Going to L2")
+        A.moveTo(13, 4, -18, DIR_W)
+        s = "L2"
+    end
+    if s == "L2" then
+        log("Going to L3")
+        A.moveTo(9, 2, -20, DIR_W)
+        s = "L3"
+    end
+    if s == "L3" then
+        log("Going to L4")
+        A.moveTo(6, 3, -20, DIR_N)
+        s = "L4"
+    end
+    if s == "L4" then
+        log("Going to L5")
+        A.moveTo(6, 4, -26, DIR_N)
+        s = "L5"
+    end
+end
+
+local function GotoL1(s)
+    -- Move along chain: L5 -> L4 -> L3 -> L2 -> L1
+    if s == "L5" then
+        log("Going to L4")
+        A.moveTo(6, 3, -20, DIR_S)
+        s = "L4"
+    end
+    if s == "L4" then
+        log("Going to L3")
+        A.moveTo(9, 2, -20, DIR_E)
+        s = "L3"
+    end
+    if s == "L3" then
+        log("Going to L2")
+        A.moveTo(13, 4, -18, DIR_E)
+        s = "L2"
+    end
+    if s == "L2" then
+        log("Going to L1")
+        A.moveTo(20, 4, -17, DIR_W)
+        s = "L1"
+    end
+end
+
+local function nearestLH()
+    A.startGPS()
+    local x, y, z, d = A.getLocation()
+    if not x then
+        x, y, z, d = A.setLocationFromGPS()
+    end
+    local best, dist
+    for _, l in ipairs(lighthouses) do
+        local dx, dy, dz = x - l.x, y - l.y, z - l.z
+        local ds = dx * dx + dy * dy + dz * dz
+        if not dist or ds < dist then
+            dist = ds
+            best = l
+        end
+    end
+    return best and best.n or "L1"
+end
+
+----------------------------------------------------------
+-- COORD HELPERS (GRID TO WORLD POS)
+----------------------------------------------------------
+
+local function wallPos(base, rows, cols, i)
+    -- For srcBase: slot 1 is top left (3,4,-27), slot 16 is bottom right (6,0,-27)
+    if base == srcBase then
+        local col = ((i - 1) % cols)      -- 0..3 (x: 3..6)
+        local row = math.floor((i - 1) / cols) -- 0..3 (y: 4..1)
+        local x = 3 + col
+        local y = 4 - row
+        local z = -27
+        return x, y, z, base.dir
+    -- For destBase: slot 1 is top left (21,4,-24), slot 40 is bottom right (21,0,-17)
+    elseif base == destBase then
+        local col = ((i - 1) % cols)
+        local row = math.floor((i - 1) / cols)
+        local x = 21
+        local y = 4 - row
+        local z = -24 + col
+        return x, y, z, base.dir
+    else
+        -- Fallback: old logic for any other base
+        local row = math.floor((i - 1) / cols) + 1
+        local col = ((i - 1) % cols) + 1
+        local rd = (base.dir + 3) % 4
+        local dx = 0
+        local dz = 0
+        if rd == DIR_W then
+            dx = -1
+        elseif rd == DIR_E then
+            dx = 1
+        elseif rd == DIR_N then
+            dz = -1
+        elseif rd == DIR_S then
+            dz = 1
+        end
+        local x = base.x + dx * (col - 1)
+        local y = base.y + (row - 1)
+        local z = base.z + dz * (col - 1)
+        return x, y, z, base.dir
+    end
+end
+
+-- (moveSlot function is defined later in the file)
+
+----------------------------------------------------------
+-- REFUEL
+----------------------------------------------------------
+
+local function refuel()
+    local lvl = turtle.getFuelLevel()
+    if lvl ~= "unlimited" and lvl < 500 then
+        for s = 1, 16 do
+            local d = turtle.getItemDetail(s)
+            if d and (d.name == "minecraft:coal" or d.name == "minecraft:charcoal") then
+                turtle.select(s)
+                turtle.refuel()
+            end
+        end
+    end
+end
+
+----------------------------------------------------------
+-- INVENTORY HELPERS
+----------------------------------------------------------
+
+local function isInventoryFull()
+    for s = 1, 16 do
+        if turtle.getItemCount(s) == 0 then
+            return false
+        end
+    end
+    return true
+end
+
+----------------------------------------------------------
+-- SORT LOGIC / DB MAPPING
+----------------------------------------------------------
+
+local itemSlot = {}
+local nextFree = 1
+
+local function rebuildItemSlotIndex()
+    itemSlot = {}
+    nextFree = 1
+    for idx, v in pairs(drawerDB.destination) do
+        itemSlot[v.item] = idx
+        if idx >= nextFree then
+            nextFree = idx + 1
+        end
+    end
+end
+
+-- Get / assign a destination slot index for this item name
+-- Get / assign a destination slot index for this item name
+-- IMPORTANT: this prefers existing DB mapping so items go
+-- back into already-known drawers.
+local function slotFor(item)
+    -- 1) If we already know item -> idx in memory, use that
+    if itemSlot[item] then
+        return itemSlot[item]
+    end
+
+    -- 2) Scan DB for an existing drawer mapped to this item
+    for idx, rec in pairs(drawerDB.destination) do
+        if rec.item == item then
+            itemSlot[item] = idx
+            return idx
+        end
+    end
+
+    -- 3) Assign a new slot only if there is space
+    if nextFree > DEST_ROWS * DEST_COLS then
+        log("[WARN] No free destination drawer slot for item: " .. item)
+        return nil
+    end
+
+    itemSlot[item] = nextFree
+    log("[MAP] Assigned NEW drawer idx " .. nextFree .. " for item " .. item)
+    nextFree = nextFree + 1
+    return itemSlot[item]
+end
+
+-- Drop the current selected stack into a destination drawer index
+local function dropInto(idx, name, count)
+    local x, y, z, d = wallPos(destBase, DEST_ROWS, DEST_COLS, idx)
+    log("at draw1 " .. tostring(idx))
+    dbg(string.format("dropInto: moving to slot %d for %s at (%d,%d,%d) dir=%d", idx, name, x, y, z, d))
+
+    -- Move in front of the drawer
+    A.moveTo(x, y, z, d)
+
+    -- Ensure we are actually in front of a drawer
+    local ok, result = pcall(turtle.inspect)
+    local isDrawer = false
+    local blockName = "nil"
+
+    if ok and type(result) == "table" and result.name then
+        blockName = result.name
+        if string.find(result.name, "drawer") then
+            isDrawer = true
+        end
+    end
+
+    if not isDrawer then
+        log("[WARN] Not a drawer at dest idx " .. idx .. "! Block: " .. blockName)
+        return false
+    end
+
+    turtle.drop()
+
+    drawerDB.destination[idx] = drawerDB.destination[idx] or {}
+    drawerDB.destination[idx].item  = name
+    drawerDB.destination[idx].count = (drawerDB.destination[idx].count or 0) + (count or 0)
+    drawerDB.destination[idx].x     = x
+    drawerDB.destination[idx].y     = y
+    drawerDB.destination[idx].z     = z
+    drawerDB.destination[idx].dir   = d
+
+    saveDrawerDB()
+    return true
+end
+
+----------------------------------------------------------
+-- PICKUP FROM SOURCE DRAWERS
+----------------------------------------------------------
+
+-- Pull items from a single source drawer into inventory.
+-- Returns true if inventory became full during pulling.
+local function pickupFromSourceDrawer(i)
+    moveSlot(srcBase, SRC_ROWS, SRC_COLS, i)
+    dbg("pickupFromSourceDrawer(" .. i .. ") at " .. posToString())
+
+    while not isInventoryFull() do
+        if not turtle.suck() then
+            -- Drawer empty
+            return false
+        end
+    end
+    -- Inventory full
+    return true
+end
+
+-- Walk all source drawers until inventory is full or all drawers tried
+local function pickupAllFromSources()
+    log("Collecting from all source drawers until inventory full...")
+    for i = 1, SRC_ROWS * SRC_COLS do
+        if isInventoryFull() then
+            log("Inventory already full before source drawer " .. i)
+            return
+        end
+        local full = pickupFromSourceDrawer(i)
+        if full then
+            log("Inventory full after source drawer " .. i)
+            return
+        end
+    end
+end
+
+----------------------------------------------------------
+-- DEPOSIT INVENTORY INTO DEST DRAWERS
+----------------------------------------------------------
+
+    log("Depositing all items into destination drawers per DB...")
+    for slot = 1, 16 do
+        local detail = turtle.getItemDetail(slot)
+        if detail and detail.count > 0 then
+            local idx = slotFor(detail.name)
+            if idx then
+                turtle.select(slot)
+                dropInto(idx, detail.name, detail.count)
+            else
+                log("[WARN] No slot for item " .. detail.name .. " (leaving in inventory)")
+            end
+        end
+    end
+    turtle.select(1)
+
+-- Move to a specific slot on a wall (source or destination)
+local function moveSlot(base, r, c, i)
+    local x, y, z, d = wallPos(base, r, c, i)
+    if base == destBase then
+        log("at draw1 " .. tostring(i))
+    elseif base == srcBase then
+        log("at draw2 " .. tostring(i))
+    end
+    dbg(string.format("moveSlot(i=%d) -> (%d,%d,%d) dir=%d", i, x, y, z, d))
+    A.moveTo(x, y, z, d)
+end
+
+local function depositAllToDest()
+    log("Depositing all items into destination drawers per DB...")
+    for slot = 1, 16 do
+        local detail = turtle.getItemDetail(slot)
+        if detail and detail.count > 0 then
+            local idx = slotFor(detail.name)
+            if idx then
+                turtle.select(slot)
+                dropInto(idx, detail.name, detail.count)
+            else
+                log("[WARN] No slot for item " .. detail.name .. " (leaving in inventory)")
+            end
+        end
+    end
+    turtle.select(1)
+end
+
+
+----------------------------------------------------------
+-- MAIN LOOP
+----------------------------------------------------------
+
+local function main()
+    loadDrawerDB()
+    rebuildItemSlotIndex()
+
+    A.startGPS()
+    A.setLocationFromGPS()
+    dbg("Starting Drawie at " .. posToString())
+
+    while true do
+        refuel()
+
+        --------------------------------------------------
+        -- PHASE 1: PICKUP  (L1 -> L5, then source drawers)
+        --------------------------------------------------
+        local here = nearestLH()
+        if here ~= "L1" then
+            log("Nearest LH=" .. tostring(here) .. ", routing to L1")
+            GotoL1(here)
+        end
+
+        log("Routing L1 -> L5")
+        GotoL5("L1")
+
+        pickupAllFromSources()
+
+        --------------------------------------------------
+        -- PHASE 2: DEPOSIT (L5 -> L1, then dest drawers)
+        --------------------------------------------------
+        here = nearestLH()
+        if here ~= "L5" then
+            log("Nearest LH=" .. tostring(here) .. ", routing to L5")
+            GotoL5(here)
+        end
+
+        log("Routing L5 -> L1")
+        GotoL1("L5")
+
+        -- Keep depositing until inventory is not full
+        while isInventoryFull() do
+            log("Inventory still full after deposit, repeating deposit phase...")
+            depositAllToDest()
+        end
+        depositAllToDest() -- Final deposit for any remaining items
+
+        -- Loop forever
+    end
+end
+
+----------------------------------------------------------
+-- PARALLEL: HEARTBEAT + MAIN
+----------------------------------------------------------
+
+parallel.waitForAny(
+    function()
+        while true do
+            heartbeat("RUN")
+            sleep(5)
+        end
+    end,
+    main
+)

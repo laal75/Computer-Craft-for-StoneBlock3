@@ -1,0 +1,273 @@
+-- 3x3 Tunnel digger with chunky-turtle signalling + netherrack return
+-- FULL CLEAN REWRITE OF OPTION C WITH REDSTONE DIRECTION DETECTION
+
+local ident = "miner1"
+
+-------------------------------------------------------
+-- NETHERRACK DETECTION
+-------------------------------------------------------
+local function detectNetherrack()
+    local checks = {
+        turtle.inspect,
+        turtle.inspectUp,
+        turtle.inspectDown
+    }
+
+    for _, fn in ipairs(checks) do
+        local ok, data = fn()
+        if ok and data and data.name == "minecraft:netherrack" then
+            print("!!! NETHERRACK FOUND ? RETURNING HOME !!!")
+            return true
+        end
+    end
+
+    return false
+end
+
+-------------------------------------------------------
+-- FUEL HANDLING
+-------------------------------------------------------
+local function grabFuel()
+    for i = 1, 15 do
+        turtle.select(i)
+        turtle.refuel()
+    end
+end
+
+grabFuel()
+
+-------------------------------------------------------
+-- SIGNAL-AWARE TURTLE DETECTION
+-------------------------------------------------------
+local function detectTurtleInFront()
+    local ok, data = turtle.inspect()
+    return ok and data and data.name:match("turtle")
+end
+
+local function detectTurtleLeft()
+    turtle.turnLeft()
+    local ok, data = turtle.inspect()
+    turtle.turnRight()
+    return ok and data and data.name:match("turtle")
+end
+
+local function detectTurtleRight()
+    turtle.turnRight()
+    local ok, data = turtle.inspect()
+    turtle.turnLeft()
+    return ok and data and data.name:match("turtle")
+end
+
+local function detectTurtleUp()
+    local ok, data = turtle.inspectUp()
+    return ok and data and data.name:match("turtle")
+end
+
+local function detectTurtleDown()
+    local ok, data = turtle.inspectDown()
+    return ok and data and data.name:match("turtle")
+end
+
+-------------------------------------------------------
+-- REDSTONE SIGNAL OUTPUT CORRECT SIDES
+-------------------------------------------------------
+
+-- Pulse redstone for 0.4 seconds
+local function pulse(side)
+    print("Sending MOVE signal on side:", side)
+    redstone.setOutput(side, true)
+    sleep(0.4)
+    redstone.setOutput(side, false)
+end
+
+local function signalChunky()
+    -- FRONT
+    if detectTurtleInFront() then
+        pulse("front")
+        return true
+    end
+
+    -- LEFT
+    if detectTurtleLeft() then
+        pulse("left")
+        return true
+    end
+
+    -- RIGHT
+    if detectTurtleRight() then
+        pulse("right")
+        return true
+    end
+
+    -- UP
+    if detectTurtleUp() then
+        pulse("top")
+        return true
+    end
+
+    -- DOWN
+    if detectTurtleDown() then
+        pulse("bottom")
+        return true
+    end
+
+    return false
+end
+
+-------------------------------------------------------
+-- SAFE DIG / MOVE
+-------------------------------------------------------
+
+local function digSafe()
+    while turtle.detect() do
+        if detectTurtleInFront() then
+            signalChunky()
+            sleep(0.3)
+        else
+            turtle.dig()
+        end
+        sleep(0.1)
+    end
+end
+
+local function moveSafe()
+    digSafe()
+    while not turtle.forward() do
+        if detectTurtleInFront() then
+            signalChunky()
+            sleep(0.3)
+        else
+            turtle.dig()
+        end
+    end
+end
+
+local function digSafeUp()
+    while turtle.detectUp() do
+        if detectTurtleUp() then
+            pulse("top")
+            sleep(0.3)
+        else
+            turtle.digUp()
+        end
+        sleep(0.1)
+    end
+end
+
+-------------------------------------------------------
+-- RETURN HOME
+-------------------------------------------------------
+local distanceFromChest = 0
+
+local function returnHome()
+    print("Returning home!")
+
+    turtle.turnLeft()
+    turtle.turnLeft()
+
+    for d = 1, distanceFromChest do
+        turtle.forward()
+    end
+
+    turtle.turnRight()
+    turtle.forward()
+    turtle.down()
+
+    grabFuel()
+
+    for slot = 1, 15 do
+        turtle.select(slot)
+        turtle.drop()
+    end
+
+    print("STOPPING.")
+    while true do sleep(1) end
+end
+
+-------------------------------------------------------
+-- STARTUP POSITION (middle right)
+-------------------------------------------------------
+
+turtle.turnRight()
+moveSafe()
+digSafeUp()
+turtle.up()
+turtle.turnLeft()
+
+print("Infinite tunnel mode enabled.")
+
+-------------------------------------------------------
+-- MAIN LOOP
+-------------------------------------------------------
+
+while true do
+    if detectNetherrack() then
+        returnHome()
+    end
+
+    if turtle.getFuelLevel() < 1500 then
+        grabFuel()
+    end
+
+    distanceFromChest = distanceFromChest + 1
+    print("Step:", distanceFromChest, "Fuel:", turtle.getFuelLevel())
+
+    -- Right
+    moveSafe()
+    turtle.digDown()
+    digSafeUp()
+
+    -- Center
+    turtle.turnLeft()
+    moveSafe()
+    turtle.digDown()
+    digSafeUp()
+
+    -- Left
+    moveSafe()
+    turtle.digDown()
+    digSafeUp()
+
+    -- Torch Placement
+    if distanceFromChest % 7 == 1 then
+        turtle.back()
+        turtle.select(16)
+        turtle.place()
+        turtle.back()
+        turtle.turnRight()
+    else
+        turtle.back()
+        turtle.back()
+        turtle.turnRight()
+    end
+
+    -- Inventory dump every 32 blocks
+    if distanceFromChest % 32 == 0 then
+        turtle.turnLeft()
+        turtle.turnLeft()
+        local dist = distanceFromChest - 1
+
+        for i = 0, dist do
+            turtle.forward()
+        end
+
+        turtle.turnRight()
+        turtle.forward()
+        turtle.down()
+
+        grabFuel()
+
+        for slot = 1, 15 do
+            turtle.select(slot)
+            turtle.drop()
+        end
+
+        turtle.back()
+        turtle.turnRight()
+        turtle.up()
+
+        for i = 0, dist do
+            turtle.forward()
+        end
+    end
+end

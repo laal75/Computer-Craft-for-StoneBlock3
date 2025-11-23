@@ -1,0 +1,184 @@
+-- 3x3 Tunnel digger with infinite mode + netherrack return home
+-- Original by Scott 'Satscape' Hather
+-- Modified to dig forever until netherrack is found
+
+local ident="miner1"
+
+-- === NETHERRACK DETECTION ===
+function detectNetherrack()
+    local checks = {
+        turtle.inspect,
+        turtle.inspectUp,
+        turtle.inspectDown
+    }
+
+    for _, fn in ipairs(checks) do
+        local ok, data = fn()
+        if ok and data and data.name == "minecraft:netherrack" then
+            print("!!! NETHERRACK DETECTED ? RETURNING HOME !!!")
+            return true
+        end
+    end
+
+    return false
+end
+
+-- === FUEL ===
+function grabFuel()
+    for i=1,15 do
+        turtle.select(i)
+        turtle.refuel()
+    end
+end
+
+grabFuel()
+
+if turtle.getItemCount(16) == 0 then
+    print("NO torches in slot 16")
+    print("Continue without torches? (Y/N)")
+    local yn = read()
+    if yn ~= "Y" then return end
+end
+
+distanceFromChest = 0
+
+function digAndMove()
+    while turtle.detect() do
+        turtle.dig()
+        os.sleep(0.5)
+    end
+    turtle.forward()
+end
+
+function digSafeUp()
+    while turtle.detectUp() do
+        turtle.digUp()
+        os.sleep(0.5)
+    end
+end
+
+-- === RETURN HOME ROUTINE ===
+function returnHome()
+    print("Returning home?")
+
+    turtle.turnLeft()
+    turtle.turnLeft()
+
+    for d = 1, distanceFromChest do
+        turtle.forward()
+    end
+
+    turtle.turnRight()
+    turtle.forward()
+    turtle.down()
+
+    grabFuel()
+    for slot=1, 15 do
+        turtle.select(slot)
+        turtle.drop()
+    end
+
+    print("Home reached. Stopping due to netherrack.")
+    while true do sleep(1) end
+end
+
+-- === Move to starting position (middle-right) ===
+turtle.turnRight()
+digAndMove()
+digSafeUp()
+turtle.up()
+turtle.turnLeft()
+
+print("? Infinite tunnel mode enabled.")
+print("Turtle will dig forever until netherrack is found.")
+
+---==== is turtle in front ====---
+
+local function isTurtleInFront()
+    local ok, data = turtle.inspect()
+    if not ok then return false end
+    return data.name == "computercraft:turtle_normal"
+end
+
+
+
+
+
+-- === MAIN LOOP (infinite) ===
+while true do
+
+    -- Stop and come home if netherrack detected
+    if detectNetherrack() then
+        returnHome()
+    end
+
+    -- Keep lots of fuel
+    if turtle.getFuelLevel() < 1500 then
+        grabFuel()
+    end
+
+    print("Diggy Diggy hole ? fuel:", turtle.getFuelLevel())
+    distanceFromChest = distanceFromChest + 1
+
+    digAndMove()         -- middle right
+    turtle.digDown()
+    digSafeUp()
+
+    turtle.turnLeft()
+
+    digAndMove()         -- middle center
+    turtle.digDown()
+    digSafeUp()
+
+    digAndMove()         -- middle left
+    turtle.digDown()
+    digSafeUp()
+
+    -- Torch placement every 7 blocks
+    if distanceFromChest % 7 == 1 then
+        turtle.back()
+        turtle.select(16)
+        turtle.place()
+        turtle.back()
+        turtle.turnRight()
+    else
+        turtle.back()
+        turtle.back()
+        turtle.turnRight()
+    end
+
+    -- Empty inventory every 32 blocks
+    if distanceFromChest % 32 == 0 then
+        turtle.turnLeft()
+        turtle.turnLeft()
+        local distance = distanceFromChest - 1
+
+        for i=0, distance do
+            turtle.forward()
+        end
+
+        turtle.turnRight()
+        turtle.forward()
+        turtle.down()
+
+        os.sleep(1)
+
+        grabFuel()
+
+        print("Refuelled, dropped off load.")
+
+        for slot=1, 15 do
+            turtle.select(slot)
+            turtle.drop()
+        end
+
+        os.sleep(1)
+        turtle.back()
+        turtle.turnRight()
+        turtle.up()
+
+        for i=0, distance do
+            turtle.forward()
+        end
+    end
+end

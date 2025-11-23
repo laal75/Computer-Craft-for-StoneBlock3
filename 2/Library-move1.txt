@@ -1,0 +1,81 @@
+os.loadAPI("apis/A")
+-- Wood get 
+local x1 = 37
+local y1 = 0
+local z1 = -21
+-- Wood deposit
+local x2 = 9 
+local y2 = 4
+local z2 = 3
+
+-- Refuel
+local function grabFuel()
+	 fuellevelstart = turtle.getFuelLevel()
+	print("Fuel level at :", turtle.getFuelLevel())
+	if fuellevelstart < 1000 then
+		print("Fuel Low")
+		for i = 1, 16 do
+			turtle.select(i)
+			turtle.refuel()
+		end
+	else
+		print("No Fuel Needed")
+	end
+    turtle.select(1)
+	print("turtle.getFuelLevel()")
+end
+
+local function GotoDeposit()
+	print("Going to Deposit")
+	print(A.startGPS())
+	print(A.setLocationFromGPS())
+	A.moveTo(x2, y2, z2, South)
+	print("Here!")
+
+end
+
+local function GotoWood()
+	print("Going to get Wood")
+	print("Is GPS on :",A.startGPS(), "[T/F]")
+	print("current location :",A.setLocationFromGPS())
+	A.moveTo(x1, y1, z1, West)
+	print("Here!")
+
+end
+
+local function pullFromDrawer()
+    print("Pulling items...")
+    local pulled = false
+    while turtle.suck() do 
+		pulled = true 
+	end
+    print(pulled and "Pulled all items." or "Nothing to pull.")
+	
+end
+
+local function depositToDrawer()
+    print("Depositing items...")
+    local deposited = false
+    for slot=1,16 do
+        turtle.select(slot)
+        if turtle.drop() then deposited = true 
+		end
+    end
+    turtle.select(1)
+    print(deposited and "Deposited all items." or "Nothing to deposit.")
+	
+end
+
+while true do
+print("Getting Fuel...")
+pullFromDrawer()
+print("refueling")
+grabFuel()
+
+GotoDeposit()
+depositToDrawer()
+
+GotoWood()
+
+
+end

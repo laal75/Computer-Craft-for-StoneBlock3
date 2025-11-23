@@ -1,0 +1,33 @@
+
+----------------------------------------------------------
+-- DRAWER DETECTION SCRIPT
+----------------------------------------------------------
+
+local function detectDrawers()
+    print("Detecting drawers for draw1 (dest wall)...")
+    for i = 1, DEST_ROWS * DEST_COLS do
+        local x, y, z, d = wallPos(destBase, DEST_ROWS, DEST_COLS, i)
+        A.moveTo(x, y, z, d)
+        local ok, data = pcall(turtle.inspect)
+        if ok and data and data.name then
+            print(string.format("draw1 slot %d: %s at (%d,%d,%d)", i, data.name, x, y, z))
+        else
+            print(string.format("draw1 slot %d: [no block] at (%d,%d,%d)", i, x, y, z))
+        end
+    end
+
+    print("Detecting drawers for draw2 (src wall)...")
+    for i = 1, SRC_ROWS * SRC_COLS do
+        local x, y, z, d = wallPos(srcBase, SRC_ROWS, SRC_COLS, i)
+        A.moveTo(x, y, z, d)
+        local ok, data = pcall(turtle.inspect)
+        if ok and data and data.name then
+            print(string.format("draw2 slot %d: %s at (%d,%d,%d)", i, data.name, x, y, z))
+        else
+            print(string.format("draw2 slot %d: [no block] at (%d,%d,%d)", i, x, y, z))
+        end
+    end
+end
+
+-- Uncomment to run detection on script start:
+detectDrawers()

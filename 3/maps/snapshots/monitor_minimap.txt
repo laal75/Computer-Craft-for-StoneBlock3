@@ -1,5 +1,5 @@
 # Monitor Minimap Snapshot
-# Generated: 2025-11-22 09:29:45
+# Generated: 2025-11-23 18:16:08
 # Bounds: X[-5..18] Z[-13..6] Y=0
 # Grid size: 20x24
 

@@ -1,0 +1,321 @@
+-- tunneler_a.lua  (Turtle A: 3x3 tunneler + auto requests + GPS broadcasts + handshake)
+-- Run this on your mining turtle.
+
+-- CONFIG
+local MODEM_SIDE = "left"          -- change if your modem is on a different side
+local MIN_FUEL = 10
+local HOP_INTERVAL = 2
+local FUEL_ITEMS = { "minecraft:coal", "minecraft:charcoal", "minecraft:coal_block" }
+local BROADCAST_EVERY_STEPS = 5    -- broadcast GPS every N steps
+local BROADCAST_FAST = 1           -- faster broadcast while waiting for support
+local GPS_TIMEOUT = 2
+local GPS_RETRIES = 3
+local HANDSHAKE_TIMEOUT = 12       -- seconds to wait for support handshake
+
+-- COMM
+rednet.open(MODEM_SIDE)
+
+-- STATE
+local path = {}
+local steps = 0
+local broadcastInterval = BROADCAST_EVERY_STEPS
+local lastBroadcastPos = nil
+local last2pos = {}                -- keep last two gps coords for forward vector
+local awaitingSupport = false
+
+-- UTILITIES
+local function debug(...) print("[A]", ...) end
+
+local function gpsLocate()
+    for i=1,GPS_RETRIES do
+        local x,y,z = gps.locate(GPS_TIMEOUT)
+        if x then return x,y,z end
+        sleep(0.1)
+    end
+    return nil
+end
+
+local function inTable(tbl, val)
+    for _,v in ipairs(tbl) do if v==val then return true end end
+    return false
+end
+
+local function countInventory()
+    local used = 0
+    for s=1,16 do if turtle.getItemCount(s) > 0 then used = used + 1 end end
+    return used
+end
+
+local function hasFuelItem()
+    for s=1,16 do
+        local d = turtle.getItemDetail(s)
+        if d and d.name then
+            for _,name in ipairs(FUEL_ITEMS) do
+                if d.name == name then return true end
+            end
+        end
+    end
+    return false
+end
+
+local function tryRefuelFromInventory(target)
+    target = target or MIN_FUEL
+    for s=1,16 do
+        local d = turtle.getItemDetail(s)
+        if d and d.name then
+            for _,name in ipairs(FUEL_ITEMS) do
+                if d.name == name then
+                    turtle.select(s)
+                    if turtle.refuel(1) then
+                        debug("Refueled from inventory. Level:", turtle.getFuelLevel())
+                        if turtle.getFuelLevel() >= target then return true end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- movement with logging (these must NOT loop forever)
+local function loggedForward()
+    while turtle.detect() do
+        turtle.dig()
+        sleep(0.05)
+    end
+    if turtle.forward() then table.insert(path,"forward"); steps = steps + 1; return true end
+    return false
+end
+local function loggedUp()
+    while turtle.detectUp() do turtle.digUp(); sleep(0.05) end
+    if turtle.up() then table.insert(path,"up"); steps = steps + 1; return true end
+    return false
+end
+local function loggedDown()
+    while turtle.detectDown() do turtle.digDown(); sleep(0.05) end
+    if turtle.down() then table.insert(path,"down"); steps = steps + 1; return true end
+    return false
+end
+
+local function returnHome()
+    debug("Returning home (following saved path)...")
+    for i = #path, 1, -1 do
+        local move = path[i]
+        if move == "forward" then turtle.back()
+        elseif move == "up" then turtle.down()
+        elseif move == "down" then turtle.up() end
+        sleep(0.05)
+    end
+    debug("Home reached. Stopping.")
+    while true do sleep(1) end
+end
+
+-- netherrack detection (emergency)
+local function detectNetherrack()
+    local checks = {turtle.inspect, turtle.inspectUp, turtle.inspectDown}
+    for _,fn in ipairs(checks) do
+        local ok,data = fn()
+        if ok and data and data.name == "minecraft:netherrack" then
+            debug("!!! NETHERRACK FOUND !!!")
+            return true
+        end
+    end
+    return false
+end
+
+-- fuel handling: try local then ask support
+local function refuelIfNeeded()
+    if turtle.getFuelLevel() == "unlimited" then return end
+    if turtle.getFuelLevel() > MIN_FUEL then return end
+
+    debug("Fuel low -> trying inventory")
+    if tryRefuelFromInventory(MIN_FUEL) then return end
+
+    -- ask support
+    debug("No fuel in inventory -> requesting support (needfuel)")
+    rednet.broadcast("needfuel", "tunnel")
+    awaitingSupport = "fuel"
+    broadcastInterval = BROADCAST_FAST
+    local start = os.time()
+    while os.time() - start < HANDSHAKE_TIMEOUT do
+        -- wait for support handshake to complete (receiver handles incoming messages)
+        if turtle.getFuelLevel() > MIN_FUEL then
+            awaitingSupport = false
+            broadcastInterval = BROADCAST_EVERY_STEPS
+            return
+        end
+        sleep(0.5)
+    end
+
+    debug("Support did not deliver fuel in time -> returning home")
+    returnHome()
+end
+
+-- inventory handling: if near full, request empty
+local function requestEmptyIfNeeded()
+    if countInventory() < 13 then return end
+    debug("Inventory near full -> requesting support (needempty)")
+    rednet.broadcast("needempty", "tunnel")
+    awaitingSupport = "empty"
+    broadcastInterval = BROADCAST_FAST
+    local start = os.time()
+    while os.time() - start < HANDSHAKE_TIMEOUT do
+        -- expect B to send a confirmation after transfer; receiver will handle
+        if countInventory() < 8 then
+            awaitingSupport = false
+            broadcastInterval = BROADCAST_EVERY_STEPS
+            return
+        end
+        sleep(0.5)
+    end
+    debug("Emptying failed/timed out -> returning home")
+    returnHome()
+end
+
+-- compute forward unit vector from last two GPS points (returns {dx,dy,dz} with -1/0/1 components)
+local function forwardVector()
+    if #last2pos < 2 then return nil end
+    local a = last2pos[#last2pos-1]
+    local b = last2pos[#last2pos]
+    if not (a and b) then return nil end
+    local dx = b.x - a.x
+    local dy = b.y - a.y
+    local dz = b.z - a.z
+    -- normalize to -1/0/1
+    if math.abs(dx) >= math.abs(dz) then
+        dx = (dx>0 and 1) or (dx<0 and -1) or 0
+        dz = 0
+    else
+        dz = (dz>0 and 1) or (dz<0 and -1) or 0
+        dx = 0
+    end
+    dy = (dy>0 and 1) or (dy<0 and -1) or 0
+    return { x = dx, y = dy, z = dz }
+end
+
+-- BROADCASTER: broadcast GPS every broadcastInterval steps (and on demand)
+local function broadcaster()
+    while true do
+        if steps % broadcastInterval == 0 then
+            local x,y,z = gpsLocate()
+            if x then
+                -- keep last two positions
+                table.insert(last2pos, {x=x,y=y,z=z})
+                if #last2pos > 2 then table.remove(last2pos,1) end
+                rednet.broadcast({ tag = "here", x = x, y = y, z = z, step = steps }, "tunnel")
+                lastBroadcastPos = {x=x,y=y,z=z}
+            end
+        end
+        sleep(0.5)
+    end
+end
+
+-- RECEIVER: handle support messages and handshakes
+local function receiver()
+    while true do
+        local senderId, msg, proto = rednet.receive("tunnel")
+        if not msg then sleep(0.05) else
+            if type(msg) == "string" then
+                if msg == "ready_fuel" then
+                    debug("Support arrived for fuel -> performing drop/suck handshake")
+                    -- support is ready: do the dance: turn around, suck, turn back
+                    turtle.turnLeft(); turtle.turnLeft()
+                    -- attempt several sucks (support will place multiple items)
+                    for i=1,6 do
+                        turtle.suck()
+                        sleep(0.15)
+                    end
+                    -- try immediate refuel from inventory
+                    tryRefuelFromInventory()
+                    turtle.turnLeft(); turtle.turnLeft()
+                    rednet.send(senderId, "fuel_received", "tunnel")
+                    awaitingSupport = false
+                    broadcastInterval = BROADCAST_EVERY_STEPS
+                elseif msg == "ready_empty" then
+                    debug("Support ready to receive items -> dropping")
+                    turtle.turnLeft(); turtle.turnLeft()
+                    -- drop all non-tool items (simple: drop everything)
+                    for s=1,16 do
+                        turtle.select(s)
+                        turtle.drop()
+                        sleep(0.02)
+                    end
+                    turtle.turnLeft(); turtle.turnLeft()
+                    rednet.send(senderId, "empty_received", "tunnel")
+                    awaitingSupport = false
+                    broadcastInterval = BROADCAST_EVERY_STEPS
+                elseif msg == "ping" then
+                    -- ignore
+                end
+            elseif type(msg) == "table" and msg.tag == "reqcoords" then
+                local x,y,z = gpsLocate()
+                if x then rednet.send(senderId, { tag = "here", x=x,y=y,z=z, step=steps }, "tunnel") end
+            end
+        end
+    end
+end
+
+-- HOP: up + forward + down
+local function hop()
+    if turtle.detectUp() then turtle.digUp() end
+    loggedUp()
+    loggedForward()
+    if turtle.detectDown() then turtle.digDown() end
+    loggedDown()
+end
+
+-- main 3x3 tunnelling loop (uses logged moves)
+local function mine3x3Loop()
+    while true do
+        refuelIfNeeded()
+        if detectNetherrack() then returnHome() end
+
+        requestEmptyIfNeeded()
+
+        steps = steps + 0 -- steps incremented inside loggedForward/Up/Down
+        debug("Step", steps, "Fuel:", turtle.getFuelLevel(), "Inv:", countInventory())
+
+        -- 3x3 pattern: center -> left -> right (keeps orientation forward)
+        -- center column
+        loggedForward()
+        if HOP_INTERVAL > 0 and (steps % HOP_INTERVAL) == 0 then
+            hop()
+        else
+            -- explore up/down center
+            if turtle.detectUp() then turtle.digUp() end
+            loggedUp()
+            if turtle.detectDown() then turtle.digDown() end
+            loggedDown()
+        end
+
+        -- left column
+        turtle.turnLeft()
+        loggedForward()
+        if turtle.detectUp() then turtle.digUp() end
+        loggedUp()
+        if turtle.detectDown() then turtle.digDown() end
+        loggedDown()
+        turtle.turnRight()
+
+        -- right column
+        turtle.turnRight()
+        loggedForward()
+        if turtle.detectUp() then turtle.digUp() end
+        loggedUp()
+        if turtle.detectDown() then turtle.digDown() end
+        loggedDown()
+        turtle.turnLeft()
+
+        sleep(0.1)
+    end
+end
+
+-- START
+debug("Starting tunneler A")
+-- small startup GPS broadcast
+local sx,sy,sz = gpsLocate()
+if sx then
+    table.insert(last2pos, {x=sx,y=sy,z=sz})
+end
+
+parallel.waitForAny(broadcaster, receiver, mine3x3Loop)

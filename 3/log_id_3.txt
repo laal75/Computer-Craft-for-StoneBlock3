@@ -7169,3 +7169,20 @@
 [3][11-22,05:58:53]Saved worldmap to /maps/fullmap/scans/worldmap.txt
 [3][11-22,05:58:53]Minimap: Using layer Y=0 (no Roomva heartbeat, chose most populated)
 [3][11-22,05:58:53]Saved rooms to /maps/fullmap/scans/rooms.txt
+[3][11-22,14:57:57]Viewing Room 3
+[3][11-22,14:57:58]Viewing Room 2
+[3][11-22,14:57:59]Viewing Room 0
+[3][11-22,14:58:00]Viewing Room 1
+[3][11-22,14:58:01]Viewing Room 0
+[3][11-22,17:37:22]No Roomva found - loading local files
+[3][11-22,17:37:22]Minimap: Using layer Y=0 (no Roomva heartbeat, chose most populated)
+[3][11-22,17:37:22]Loaded cached worldmap from disk
+[3][11-22,17:37:22]Loaded 5 rooms from cache
+[3][11-22,17:37:22]Minimap: Using layer Y=0 (no Roomva heartbeat, chose most populated)
+[3][11-22,17:37:22]Loaded map from local storage
+[3][11-22,19:17:36]No Roomva found - loading local files
+[3][11-22,19:17:36]Minimap: Using layer Y=0 (no Roomva heartbeat, chose most populated)
+[3][11-22,19:17:36]Loaded cached worldmap from disk
+[3][11-22,19:17:36]Loaded 5 rooms from cache
+[3][11-22,19:17:36]Minimap: Using layer Y=0 (no Roomva heartbeat, chose most populated)
+[3][11-22,19:17:36]Loaded map from local storage

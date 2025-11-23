@@ -1,0 +1,169 @@
+-- miner_a.lua
+-- Mining Turtle (Turtle A)
+-- Requires modem and GPS
+
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached") end
+modem.open(10) -- outbound channel for requests / broadcasts
+modem.open(11) -- inbound channel for responses
+
+local gps = gps
+
+-- CONFIG
+local fuelThreshold = 200
+local inventoryThreshold = 13
+local broadcastEverySteps = 5
+local coordBroadcastChannel = 10
+local responseChannel = 11
+
+-- STATE
+local stepsMoved = 0
+local stopMining = false
+local homeCoords = nil
+
+-- UTILS
+local function debugPrint(...) print("[A]", ...) end
+
+local function getPos()
+    local x,y,z = gps.locate(2)
+    return x,y,z
+end
+
+local function countInventory()
+    local used = 0
+    for s=1,16 do
+        if turtle.getItemCount(s) > 0 then used = used + 1 end
+    end
+    return used
+end
+
+local fuelItems = { "minecraft:coal", "minecraft:charcoal", "minecraft:coal_block" }
+local function refuelFromInventory()
+    for s=1,16 do
+        local d = turtle.getItemDetail(s)
+        if d then
+            for _,name in ipairs(fuelItems) do
+                if d.name == name then
+                    turtle.select(s)
+                    turtle.refuel(1)
+                    if turtle.getFuelLevel() >= fuelThreshold then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- MOVEMENT
+local function safeForward()
+    while turtle.detect() do turtle.dig() sleep(0.05) end
+    if turtle.forward() then
+        stepsMoved = stepsMoved + 1
+        return true
+    end
+    return false
+end
+local function safeUp()
+    while turtle.detectUp() do turtle.digUp() sleep(0.05) end
+    return turtle.up()
+end
+local function safeDown()
+    while turtle.detectDown() do turtle.digDown() sleep(0.05) end
+    return turtle.down()
+end
+
+-- BROADCAST COORDINATES EVERY N STEPS
+local function broadcaster()
+    while true do
+        if stepsMoved % broadcastEverySteps == 0 then
+            local x,y,z = getPos()
+            if x then
+                modem.transmit(coordBroadcastChannel, responseChannel, {tag="here", x=x, y=y, z=z})
+            end
+        end
+        sleep(0.5)
+    end
+end
+
+-- AUTO MONITOR
+local function autoMonitor()
+    while true do
+        local fl = turtle.getFuelLevel()
+        if fl ~= "unlimited" and fl < fuelThreshold then
+            modem.transmit(coordBroadcastChannel, responseChannel, "needfuel")
+        end
+        local inv = countInventory()
+        if inv >= inventoryThreshold then
+            modem.transmit(coordBroadcastChannel, responseChannel, "needempty")
+        end
+        sleep(1)
+    end
+end
+
+-- RECEIVER
+local function receiver()
+    while true do
+        local _, _, _, _, msg = os.pullEvent("modem_message")
+        if type(msg) == "string" then
+            if msg == "fuelready" then
+                debugPrint("Support delivered fuel, trying to suck...")
+                turtle.suck()
+                refuelFromInventory()
+            elseif msg == "emptyready" then
+                debugPrint("Support ready to take inventory, dropping blocks...")
+                for s=1,16 do
+                    turtle.select(s)
+                    turtle.drop()
+                end
+            elseif msg == "stop" then stopMining = true
+            elseif msg == "tunnel" then stopMining = false
+            elseif msg == "home" then stopMining = true
+                local x,y,z = homeCoords[1], homeCoords[2], homeCoords[3]
+                if x then
+                    debugPrint("Returning home...")
+                    -- Simple return: move up/down then forward/back; adjust as needed
+                end
+            end
+        elseif type(msg) == "table" and msg.tag == "askcoords" then
+            local x,y,z = getPos()
+            if x then modem.transmit(coordBroadcastChannel,responseChannel,{tag="here", x=x, y=y, z=z}) end
+        end
+    end
+end
+
+-- MANUAL PROMPT
+local function manualPrompt()
+    while true do
+        write("Command (stop/home/tunnel/passfuel/getfuel): ")
+        local cmd = read()
+        if cmd == "stop" then stopMining = true
+        elseif cmd == "tunnel" then stopMining = false
+        elseif cmd == "home" then stopMining = true
+        elseif cmd == "passfuel" then
+            for s=1,16 do
+                local d = turtle.getItemDetail(s)
+                if d and table.concat(fuelItems," "):find(d.name) then
+                    turtle.select(s)
+                    turtle.drop()
+                    break
+                end
+            end
+        elseif cmd == "getfuel" then
+            modem.transmit(coordBroadcastChannel,responseChannel,"getfuel")
+        end
+    end
+end
+
+-- MINING LOOP (placeholder)
+local function mainProgram()
+    local x,y,z = getPos()
+    homeCoords = {x,y,z}
+    while true do
+        if not stopMining then
+            safeForward()
+        end
+        sleep(0.2)
+    end
+end
+
+parallel.waitForAny(mainProgram, manualPrompt, broadcaster, receiver, autoMonitor)

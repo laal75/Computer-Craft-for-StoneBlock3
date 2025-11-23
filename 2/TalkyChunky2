@@ -1,0 +1,121 @@
+-- support_b.lua
+-- Chunky Turtle B - follows Turtle A
+-- Requires modem and GPS
+
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached") end
+modem.open(10)
+modem.open(11)
+
+local gps = gps
+
+local followDistance = 1
+local lastMinerCoords = nil
+local mission = "follow"
+local followPollInterval = 1
+
+-- UTILITIES
+local function debugPrint(...) print("[B]", ...) end
+
+local function getPos()
+    local x,y,z = gps.locate(2)
+    return x,y,z
+end
+
+local function distance(a,b)
+    return math.abs(a.x-b.x)+math.abs(a.y-b.y)+math.abs(a.z-b.z)
+end
+
+local function safeForward()
+    while turtle.detect() do turtle.dig() sleep(0.05) end
+    return turtle.forward()
+end
+local function safeUp()
+    while turtle.detectUp() do turtle.digUp() sleep(0.05) end
+    return turtle.up()
+end
+local function safeDown()
+    while turtle.detectDown() do turtle.digDown() sleep(0.05) end
+    return turtle.down()
+end
+
+-- SIMPLE GPS GO-TO FUNCTION
+local function goTo(target)
+    local timeout = os.time() + 60
+    while true do
+        local curX,curY,curZ = getPos()
+        if not curX then sleep(0.2) else
+            local cur = {x=curX,y=curY,z=curZ}
+            local dist = distance(cur,target)
+            if dist <= followDistance then return true end
+
+            -- move vertically
+            if cur.y < target.y then safeUp()
+            elseif cur.y > target.y then safeDown() end
+
+            -- move horizontal (forward/back based on simple difference)
+            if cur.x < target.x or cur.z < target.z then safeForward() end
+        end
+        if os.time() > timeout then return false end
+        sleep(0.2)
+    end
+end
+
+-- GIVE FUEL
+local function giveFuel()
+    debugPrint("Giving fuel to miner")
+    for s=1,16 do
+        local d = turtle.getItemDetail(s)
+        if d and string.find(d.name,"coal") then
+            turtle.select(s)
+            turtle.drop()
+            modem.transmit(10,11,"fuelready")
+            return
+        end
+    end
+    debugPrint("No fuel available to give")
+end
+
+-- TAKE ITEMS
+local function takeItems()
+    debugPrint("Receiving items from miner")
+    local tries = 4
+    for i=1,tries do turtle.suck() sleep(0.2) end
+    modem.transmit(10,11,"emptyready")
+end
+
+-- RECEIVER
+local function receiver()
+    while true do
+        local _,_,_,_,msg = os.pullEvent("modem_message")
+        if type(msg) == "string" then
+            if msg == "needfuel" then mission="fuel"
+            elseif msg == "needempty" then mission="empty"
+            elseif msg == "stop" then mission="pause"
+            elseif msg == "tunnel" then mission="follow"
+        elseif type(msg)=="table" and msg.tag=="here" then
+            lastMinerCoords={x=msg.x,y=msg.y,z=msg.z}
+        end
+        sleep(0.05)
+    end
+end
+
+-- FOLLOWER LOOP
+local function follower()
+    while true do
+        if mission=="fuel" and lastMinerCoords then
+            goTo(lastMinerCoords)
+            giveFuel()
+            mission="follow"
+        elseif mission=="empty" and lastMinerCoords then
+            goTo(lastMinerCoords)
+            takeItems()
+            mission="follow"
+        elseif mission=="follow" and lastMinerCoords then
+            goTo(lastMinerCoords)
+        end
+        sleep(followPollInterval)
+    end
+end
+
+parallel.waitForAny(receiver, follower)

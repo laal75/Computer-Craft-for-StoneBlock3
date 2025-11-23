@@ -1,0 +1,43 @@
+local modem = peripheral.find("modem")
+modem.open(10)  -- incoming messages
+modem.open(11)  -- outgoing reply channel
+
+------------------------------------------------------
+-- 1. MAIN PROGRAM (not required but left as example)
+------------------------------------------------------
+local function mainProgram()
+    while true do
+        sleep(1)
+    end
+end
+
+------------------------------------------------------
+-- 2. SENDER PROGRAM (terminal input)
+------------------------------------------------------
+local function senderProgram()
+    while true do
+        write("Send: ")
+        local msg = read()
+
+        modem.transmit(10, 11, msg)
+        print("[SENT] " .. msg)
+    end
+end
+
+------------------------------------------------------
+-- 3. RECEIVER PROGRAM
+------------------------------------------------------
+local function receiverProgram()
+    while true do
+        local event, side, channel, reply, msg, dist =
+            os.pullEvent("modem_message")
+
+        print("\n[RECEIVED] " .. tostring(msg))
+        write("Send: ") -- re-draw prompt after receiving
+    end
+end
+
+------------------------------------------------------
+-- RUN ALL PROGRAMS TOGETHER
+------------------------------------------------------
+parallel.waitForAny(mainProgram, senderProgram, receiverProgram)

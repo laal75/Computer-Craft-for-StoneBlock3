@@ -1,0 +1,152 @@
+-- === CONFIG ===
+local minFuel = 1000
+local hopInterval = 2
+local fuelItems = {
+    "minecraft:coal",
+    "minecraft:charcoal",
+    "minecraft:coal_block"
+}
+
+-- === STATE ===
+local path = {}   -- movement history
+
+-- === UTILS ===
+
+local function suckFuelFromRight()
+    print("Pulling fuel from right chest...")
+    turtle.turnRight()
+    local pulled = turtle.suck()
+    turtle.turnLeft()
+
+    if pulled then
+        print("Pulled fuel from chest!")
+        return true
+    else
+        print("No fuel in right chest!")
+        return false
+    end
+end
+
+local function refuelIfNeeded()
+    if turtle.getFuelLevel() > minFuel then return end
+    print("Refueling...")
+
+    for slot = 1, 16 do
+        local detail = turtle.getItemDetail(slot)
+        if detail then
+            for _, item in ipairs(fuelItems) do
+                if detail.name == item then
+                    turtle.select(slot)
+                    turtle.refuel(1)
+                    print(" +1 fuel (" .. turtle.getFuelLevel() .. ")")
+                    if turtle.getFuelLevel() > minFuel then return end
+                end
+            end
+        end
+    end
+
+    if suckFuelFromRight() then
+        return refuelIfNeeded()
+    end
+
+    print("!!! OUT OF FUEL ? RETURNING HOME !!!")
+    returnHome()
+end
+
+local function detectNetherrack()
+    local checks = {turtle.inspect, turtle.inspectUp, turtle.inspectDown}
+    for _, fn in ipairs(checks) do
+        local ok, data = fn()
+        if ok and data and data.name == "minecraft:netherrack" then
+            print("!!! NETHERRACK FOUND !!!")
+            return true
+        end
+    end
+    return false
+end
+
+local function loggedForward()
+    turtle.forward()
+    table.insert(path, "forward")
+end
+local function loggedUp()
+    turtle.up()
+    table.insert(path, "up")
+end
+local function loggedDown()
+    turtle.down()
+    table.insert(path, "down")
+end
+
+function returnHome()
+    print("Returning home...")
+    for i = #path, 1, -1 do
+        local move = path[i]
+        if move == "forward" then turtle.back()
+        elseif move == "up" then turtle.down()
+        elseif move == "down" then turtle.up() end
+        sleep(0.1)
+    end
+    print("Home reached.")
+    while true do sleep(1) end
+end
+
+local function safeForward()
+    while turtle.detect() do
+        -- checkRedstone()
+        print("Block in front, waiting...")
+        sleep(0.2)
+    end
+    loggedForward()
+end
+
+local function hop()
+    if turtle.detectUp() then turtle.digUp() end
+    loggedUp()
+    safeForward()
+    if turtle.detectDown() then turtle.digDown() end
+    loggedDown()
+end
+
+-- Turtle detection
+local function detectTurtleInFront() local ok, data = turtle.inspect() return ok and data and data.name:match("turtle") end
+local function detectTurtleLeft() turtle.turnLeft(); local ok,data=turtle.inspect(); turtle.turnRight(); return ok and data and data.name:match("turtle") end
+local function detectTurtleRight() turtle.turnRight(); local ok,data=turtle.inspect(); turtle.turnLeft(); return ok and data and data.name:match("turtle") end
+local function detectTurtleUp() local ok,data=turtle.inspectUp() return ok and data and data.name:match("turtle") end
+local function detectTurtleDown() local ok,data=turtle.inspectDown() return ok and data and data.name:match("turtle") end
+
+-- Pulse back when redstone signal received
+local function moveBackPulse()
+    print("Received MOVE signal, moving back...")
+    turtle.back()
+end
+
+-- Listen for Miner signal
+local function checkRedstone()
+    local sides = {"front", "left", "right", "top", "bottom"}
+    print("checking redstone sides")
+    for _, side in ipairs(sides) do
+        if redstone.getInput(side) then
+            moveBackPulse()
+            return true
+        end
+    end
+    return false
+end
+
+-- === MAIN LOOP ===
+local steps = 0
+print("Starting chunky movement...")
+
+while true do
+    refuelIfNeeded()
+    if detectNetherrack() then returnHome() end
+
+    checkRedstone() -- respond to miner signals
+
+    steps = steps + 1
+    print("Step " .. steps)
+
+    if steps % hopInterval == 0 then hop() else safeForward() end
+    sleep(0.1)
+end
